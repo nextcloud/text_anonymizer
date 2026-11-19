@@ -34,6 +34,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --root-user-action=ignore --no-deps \
         "en_core_web_lg @ ${SPACY_MODEL_URL}#sha256=${SPACY_MODEL_SHA256}"
 
+# Download and install the German spaCy model for German text analysis, with checksum verification.
+# Model version and checksum - update both when upgrading (must be compatible with the locked spaCy version).
+ARG DE_SPACY_MODEL_VERSION=3.8.0
+ARG DE_SPACY_MODEL_SHA256=36fda650e476b54d5e87803635e36dadd1e8e034c4b5962088586d684f4c9fed
+RUN --mount=type=cache,target=/root/.cache/pip \
+    DE_SPACY_MODEL_URL="https://github.com/explosion/spacy-models/releases/download/de_core_news_lg-${DE_SPACY_MODEL_VERSION}/de_core_news_lg-${DE_SPACY_MODEL_VERSION}-py3-none-any.whl"; \
+    python3 -m pip install --root-user-action=ignore --no-deps \
+        "de_core_news_lg @ ${DE_SPACY_MODEL_URL}#sha256=${DE_SPACY_MODEL_SHA256}"
+
+# The GLiNER model weights (urchade/gliner_multi_pii-v1) are not baked into the image: the
+# Hugging Face hub is unreachable at build time in some environments, so the weights are
+# downloaded on first use and cached under ~/.cache/huggingface; the first task after a
+# fresh start pays the download, later starts reuse the cache.
+
 # Download and install FRP client with checksum verification
 # FRP version and checksums - update these when upgrading
 ARG FRP_VERSION=0.71.1
