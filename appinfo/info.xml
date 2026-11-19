@@ -50,6 +50,13 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 			<image>nextcloud/text_anonymizer</image>
 			<image-tag>latest</image-tag>
 		</docker-install>
+		<environment-variables>
+			<variable>
+				<name>TEXT_ANONYMIZER_MAX_FILE_BYTES</name>
+				<display-name>Maximum file size</display-name>
+				<description>Optional. Largest text file the Files actions redact, in bytes; larger files are skipped with a notification. Default: 10485760 (10 MB).</description>
+			</variable>
+		</environment-variables>
 		<routes>
 			<route>
 				<url>^/redact_file$</url>
