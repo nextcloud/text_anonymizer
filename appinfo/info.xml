@@ -17,6 +17,7 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 - **Detect sensitive text**: a TaskProcessing task that lists each distinct PII entity found in a text.
 - **Redact sensitive text**: a TaskProcessing task that replaces each PII entity with a placeholder naming its type, e.g. `Call John at 555-123-4567` becomes `Call <PERSON> at <PHONE_NUMBER>`.
 - **Redact text files**: a "Redact text" action in Files that saves a redacted copy next to the original text file, which is left unchanged.
+- **Configurable detection**: administrators can set a confidence threshold, ignore entity types and allow-list patterns under Administration settings (ExApps Settings), with environment-variable fallbacks.
 - Detects names, email addresses, phone numbers, locations, dates, credit card numbers, IBANs, IP addresses, URLs and more.
 - Handles long texts and reports task progress.
 
@@ -27,7 +28,6 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 - Redaction cannot be undone, and the detection task's output contains the sensitive values it found.
 - The Files action only supports UTF-8 encoded plain text files, not documents such as ODT, DOCX or PDF.
 - Tasks are processed one at a time on the CPU.
-- No settings yet.
 	]]>
 	</description>
 	<version>0.1.0</version>
@@ -50,6 +50,28 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 			<image>nextcloud/text_anonymizer</image>
 			<image-tag>latest</image-tag>
 		</docker-install>
+		<environment-variables>
+			<variable>
+				<name>TEXT_ANONYMIZER_ENGINE</name>
+				<display-name>Detection engine</display-name>
+				<description>Optional. Detection engine: gliner (the zero-shot PII model, the default) or spacy (the NER fallback engine).</description>
+			</variable>
+			<variable>
+				<name>TEXT_ANONYMIZER_SCORE_THRESHOLD</name>
+				<display-name>Detection confidence threshold</display-name>
+				<description>Optional. Environment fallback for the admin setting of the same name (Administration settings, ExApps Settings): a value an admin saves there overrides this one. Minimum confidence score (0.0 to 1.0) for an entity to be reported or redacted. Default: 0.5.</description>
+			</variable>
+			<variable>
+				<name>TEXT_ANONYMIZER_DENIED_ENTITY_TYPES</name>
+				<display-name>Ignored entity types</display-name>
+				<description>Optional. Environment fallback for the admin setting of the same name (Administration settings, ExApps Settings). Comma-separated entity types that are never reported or redacted, for example URL,DATE_TIME. Default: empty.</description>
+			</variable>
+			<variable>
+				<name>TEXT_ANONYMIZER_ALLOW_PATTERNS</name>
+				<display-name>Allow-list patterns</display-name>
+				<description>Optional. Environment fallback for the admin setting of the same name (Administration settings, ExApps Settings). Regular expressions, one per line; a detected entity whose text matches is kept as-is, for example public company names. Default: empty.</description>
+			</variable>
+		</environment-variables>
 		<routes>
 			<route>
 				<url>^/redact_file$</url>

@@ -19,6 +19,7 @@ help:
 	@echo "  Please use \`make <target>\` where <target> is one of"
 	@echo " "
 	@echo "  build-push        builds CPU images and uploads them to ghcr.io"
+	@echo "  eval              runs the PII detection benchmark (evals/run.py)"
 	@echo " "
 	@echo "  > Next commands are only for the dev environment with nextcloud-docker-dev!"
 	@echo "  > They must be run from the host you are developing on, not in a Nextcloud container!"
@@ -46,6 +47,10 @@ help:
 build-push:
     # docker login ghcr.io
 	DOCKER_BUILDKIT=1 docker buildx build --push --platform linux/arm64/v8,linux/amd64 --tag ghcr.io/nextcloud/$(APP_ID):latest .
+
+.PHONY: eval
+eval:
+	poetry run python evals/run.py $(ARGS)
 
 .PHONY: run31
 run31:
