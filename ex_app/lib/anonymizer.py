@@ -74,6 +74,53 @@ def detect_pii(text: str, language: str = "en", on_progress: ProgressCallback | 
     return "\n".join(f"{entity_type}: {value}" for entity_type, value in entities)
 
 
+def contains_pii(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> bool:
+    """Return whether any PII entity was found in ``text``.
+
+    Overlap resolution can only drop entities, never add them, so any raw analyzer result means
+    PII is present and the (slower) resolution pass is skipped.
+    """
+    analyzer, _ = _get_engines()
+    return bool(_analyze(analyzer, text, language, on_progress))
+
+
+def pseudonymize_text(
+    text: str, language: str = "en", on_progress: ProgressCallback | None = None
+) -> tuple[str, dict[str, str]]:
+    """Replace every PII entity with a numbered placeholder per unique entity, e.g. ``<PERSON_1>``.
+
+    Each distinct pair of entity type and value is numbered per type in order of first appearance, so the same
+    value always resolves to the same placeholder. Returns the pseudonymized text and a mapping of each
+    placeholder, e.g. ``PERSON_1``, to its original value, to be kept by the data controller for
+    re-identification.
+    """
+    analyzer, anonymizer = _get_engines()
+    results = _analyze(analyzer, text, language, on_progress)
+    # The keep pass resolves overlapping entities the same way as the replacement pass below, and its items
+    # carry the original values, so placeholders can be assigned before any text is replaced.
+    items = anonymizer.anonymize(text=text, analyzer_results=results, operators=_KEEP_OPERATORS).items
+    placeholders: dict[tuple[str, str], str] = {}
+    counters: dict[str, int] = {}
+    for item in sorted(items, key=lambda item: item.start):
+        key = (item.entity_type, item.text)
+        if key not in placeholders:
+            counters[item.entity_type] = counters.get(item.entity_type, 0) + 1
+            placeholders[key] = f"{item.entity_type}_{counters[item.entity_type]}"
+
+    def assign(entity_type: str) -> Callable[[str], str]:
+        def replace(value: str) -> str:
+            return f"<{placeholders[(entity_type, value)]}>"
+
+        return replace
+
+    operators = {
+        entity_type: OperatorConfig("custom", {"lambda": assign(entity_type)})
+        for entity_type in {result.entity_type for result in results}
+    }
+    pseudonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators).text
+    return pseudonymized, {placeholder: value for (_, value), placeholder in placeholders.items()}
+
+
 def redact_text(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:
     """Replace every PII entity in ``text`` with a placeholder naming its type, e.g. ``<PERSON>``."""
     analyzer, anonymizer = _get_engines()
