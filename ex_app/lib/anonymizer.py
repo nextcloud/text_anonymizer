@@ -6,6 +6,7 @@
 import threading
 from collections.abc import Callable
 
+from config import Settings, filter_results
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
@@ -61,21 +62,36 @@ def _analyze(
     return results
 
 
-def detect_pii(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:
+def _apply_settings(
+    results: list[RecognizerResult], text: str, settings: Settings | None
+) -> list[RecognizerResult]:
+    """Filter raw analyzer results by ``settings``; ``None`` or the built-in defaults leave
+    the results untouched, so an unconfigured deployment runs the same unfiltered analysis
+    with or without the settings layer."""
+    if settings is None or settings == Settings():
+        return results
+    return filter_results(results, text, settings)
+
+
+def detect_pii(
+    text: str, language: str = "en", on_progress: ProgressCallback | None = None, settings: Settings | None = None
+) -> str:
     """List each distinct PII entity in ``text`` as a ``TYPE: value`` line, in order of first appearance.
 
     Overlapping entities are resolved the same way as in :func:`redact_text`, so the list matches what would be
     redacted. Returns an empty string if no PII was found.
     """
     analyzer, anonymizer = _get_engines()
-    results = _analyze(analyzer, text, language, on_progress)
+    results = _apply_settings(_analyze(analyzer, text, language, on_progress), text, settings)
     items = anonymizer.anonymize(text=text, analyzer_results=results, operators=_KEEP_OPERATORS).items
     entities = dict.fromkeys((item.entity_type, item.text) for item in sorted(items, key=lambda item: item.start))
     return "\n".join(f"{entity_type}: {value}" for entity_type, value in entities)
 
 
-def redact_text(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:
+def redact_text(
+    text: str, language: str = "en", on_progress: ProgressCallback | None = None, settings: Settings | None = None
+) -> str:
     """Replace every PII entity in ``text`` with a placeholder naming its type, e.g. ``<PERSON>``."""
     analyzer, anonymizer = _get_engines()
-    results = _analyze(analyzer, text, language, on_progress)
+    results = _apply_settings(_analyze(analyzer, text, language, on_progress), text, settings)
     return anonymizer.anonymize(text=text, analyzer_results=results).text

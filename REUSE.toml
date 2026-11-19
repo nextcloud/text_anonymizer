@@ -6,6 +6,12 @@ SPDX-PackageSupplier = "2026 Nextcloud GmbH and Nextcloud contributors"
 SPDX-PackageDownloadLocation = "https://github.com/nextcloud/text_anonymizer"
 
 [[annotations]]
+path = ["evals/dataset.jsonl"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Nextcloud GmbH and Nextcloud contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
 path = "poetry.lock"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Nextcloud GmbH and Nextcloud contributors"
