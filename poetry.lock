@@ -709,14 +709,14 @@ standard-no-fastapi-cloud-cli = ["email-validator (>=2.0.0)", "fastapi-cli[stand
 
 [[package]]
 name = "filelock"
-version = "3.32.7"
+version = "4.2.12"
 description = "A platform independent file lock."
 optional = false
-python-versions = ">=3.10"
+python-versions = ">=3.11"
 groups = ["main"]
 files = [
-    {file = "filelock-3.32.7-py3-none-any.whl", hash = "sha256:65ff0d0190ea42038b32bda4b77834fb05be2cad4c5b9b01aa4dfb3614536e52"},
-    {file = "filelock-3.32.7.tar.gz", hash = "sha256:37b8a3d9811b0f9aef7e5ec5c71bb320de52df51e6ca9bcd6f5ad81187660da7"},
+    {file = "filelock-4.2.12-py3-none-any.whl", hash = "sha256:21decfec02f116ed4c954433cdb31f28c3b346b784543177b6d7059da2702ee9"},
+    {file = "filelock-4.2.12.tar.gz", hash = "sha256:7e7da24d3ac39268b0f156e56870001de44886318f092f9d851e692f7114d6dd"},
 ]
 
 [[package]]
@@ -1429,19 +1429,19 @@ files = [
 
 [[package]]
 name = "nc-py-api"
-version = "0.30.3"
+version = "0.31.0"
 description = "Nextcloud Python Framework"
 optional = false
-python-versions = ">=3.10"
+python-versions = ">=3.11"
 groups = ["main"]
 files = [
-    {file = "nc_py_api-0.30.3-py3-none-any.whl", hash = "sha256:26720b848c358c59616e255c7e8725d3a0d2c7c8d02a037c7460394378ad066f"},
-    {file = "nc_py_api-0.30.3.tar.gz", hash = "sha256:add08d4967ed86280d28a2b156965cf243c032555a8e623f59084399b3b5762e"},
+    {file = "nc_py_api-0.31.0-py3-none-any.whl", hash = "sha256:b694a91c529e76c123d0d78fc612b33ec663f9e3c1d97d183ec60f09d9e07529"},
+    {file = "nc_py_api-0.31.0.tar.gz", hash = "sha256:59c3d9975817298d7451898c5900b239ca69e5fd722dd12ada1da04d587c9af5"},
 ]
 
 [package.dependencies]
 fastapi = ">=0.133"
-filelock = ">=3.20.3,<4"
+filelock = ">=4.2.10,<5"
 niquests = ">=3.4.2,<4"
 pydantic = ">=2.1.1"
 python-dotenv = ">=1"
@@ -3442,4 +3442,4 @@ test = ["pytest", "pytest-cov"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.15"
-content-hash = "50c2e524b07dd01e15c0eb2daa6d6a0a198a5b9258623add99074ec91f73ce5f"
+content-hash = "d98ab7372b95fef01a1d99cc9c04ae809f5947f66c854e2f71001bd9f73937f6"
