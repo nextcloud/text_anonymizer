@@ -147,21 +147,14 @@ def redacted_copy_is_fresh(
 ) -> bool:
     """Whether ``node`` is already redacted and up to date, so an action on it is a no-op.
 
-    A regular file is fresh when one of its redacted copies is newer than the file itself.
-    A file that is itself a redacted copy is fresh when it is newer than the original it was
-    made from; editing the original makes the copy stale and the next run redacts both again.
+    A redacted copy is never redacted again, whatever its age. A regular file is fresh when one of its
+    redacted copies is newer than the file itself.
 
     ``copies`` is the index of a folder listing (see ``redacted_copies_by_original``); without it,
     the folder of ``node`` is listed.
     """
     if is_redacted_copy(node.user_path):
-        try:
-            original = nc.files.by_path(_original_path(node.user_path))
-        except NextcloudException as e:
-            if e.status_code == 404:
-                return False
-            raise
-        return node.info.last_modified > original.info.last_modified
+        return True
     if copies is None:
         copies = redacted_copies_by_original(nc.files.listdir(posixpath.dirname(node.user_path)))
     return any(copy.info.last_modified > node.info.last_modified for copy in copies.get(node.user_path, []))
@@ -254,9 +247,9 @@ def redact_folder(
     """Redact every text file under ``folder`` recursively, writing each copy next to its original.
 
     Files are processed one at a time; a failing file is recorded and the run continues, so files redacted
-    before the failure keep their copies. A file whose redacted copy already exists and is newer than the
-    original is skipped, so a repeated action on an unchanged folder is a no-op. ``on_progress`` is called
-    with ``(index, total, filename)`` before each file is processed.
+    before the failure keep their copies. A redacted copy is skipped whatever its age, and a file whose
+    redacted copy is newer than itself is skipped too, so a repeated action on an unchanged folder is a
+    no-op. ``on_progress`` is called with ``(index, total, filename)`` before each file is processed.
     """
     if redact is None:
         redact = redact_text
@@ -269,6 +262,9 @@ def redact_folder(
         if on_progress is not None:
             on_progress(index, total, node.name)
         try:
+            if is_redacted_copy(node.user_path):
+                report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is never redacted again"))
+                continue
             if redacted_copy_is_fresh(nc, node, copies):
                 report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
                 continue

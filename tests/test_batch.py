@@ -258,9 +258,11 @@ def test_folder_batch_numbers_copies_when_one_exists():
             ("docs/notes (redacted).txt", b"old copy", "text/plain"),
         ]
     )
-    redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
     assert "docs/notes (redacted 2).txt" in nc.files.uploads
-    assert "docs/notes (redacted 3).txt" in nc.files.uploads
+    assert list(nc.files.uploads) == ["docs/notes (redacted 2).txt"]
+    # The old copy is older than its original and is still left alone.
+    assert [result.node.name for result in report.skipped] == ["notes (redacted).txt"]
 
 
 def test_partial_failure_names_failed_file_and_keeps_other_copies():
@@ -282,27 +284,27 @@ def test_partial_failure_names_failed_file_and_keeps_other_copies():
 
 
 @pytest.mark.parametrize("status_code", [403, 423, 500])
-def test_a_file_whose_freshness_check_fails_is_reported_and_the_run_goes_on(status_code):
-    """The lookup that decides whether a copy is up to date can fail like any other request to the server."""
+def test_a_file_whose_freshness_check_fails_is_reported_and_the_run_goes_on(status_code, monkeypatch):
+    """The check whether a file is up to date is part of the per-file error handling, like download and upload."""
     nc, docs = build_folder_tree(
         [
             ("docs/01-good.txt", b"one", "text/plain"),
-            ("docs/02-locked (redacted).txt", b"copy", "text/plain"),
+            ("docs/02-bad.txt", b"two", "text/plain"),
             ("docs/03-good.txt", b"three", "text/plain"),
         ]
     )
-    by_path = nc.files.by_path
+    check = batch.redacted_copy_is_fresh
 
-    def failing_by_path(user_path):
-        if user_path == "docs/02-locked.txt":
+    def failing_check(nc_, node, copies=None):
+        if node.name == "02-bad.txt":
             raise NextcloudException(status_code, "Server error")
-        return by_path(user_path)
+        return check(nc_, node, copies)
 
-    nc.files.by_path = failing_by_path
+    monkeypatch.setattr(batch, "redacted_copy_is_fresh", failing_check)
     report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
     assert [result.node.name for result in report.redacted] == ["01-good.txt", "03-good.txt"]
     assert [(result.node.name, result.detail) for result in report.failed] == [
-        ("02-locked (redacted).txt", f"[{status_code}] Server error")
+        ("02-bad.txt", f"[{status_code}] Server error")
     ]
 
 
@@ -539,8 +541,8 @@ def test_double_dispatch_redacts_each_file_once(monkeypatch):
     assert sorted(nc.files.uploads) == ["docs/a (redacted).txt", "docs/b (redacted).txt"]
 
 
-def test_edited_original_gets_a_refreshed_copy(monkeypatch):
-    """A copy older than its original is not fresh: the edited original is redacted again."""
+def test_edited_original_gets_a_new_copy_and_the_old_one_stays(monkeypatch):
+    """A file edited after its first redaction gets a second copy; the first one is not touched."""
     nc = FakeNc()
     docs = nc.files.add_dir("docs")
     nc.files.add_file("docs/a.txt", b"one", "text/plain")
@@ -550,12 +552,7 @@ def test_edited_original_gets_a_refreshed_copy(monkeypatch):
     edited_at = FakeFiles.UPLOADED_AT + datetime.timedelta(minutes=1)
     nc.files.add_file("docs/a.txt", b"one edited", "text/plain", last_modified=edited_at)
     main.redact_files("admin", [action_info(docs, "dir")])
-    # The edited original gets a new copy; the now-stale old copy is redacted like any text file.
-    assert sorted(nc.files.uploads) == [
-        "docs/a (redacted 2).txt",
-        "docs/a (redacted 3).txt",
-        "docs/a (redacted).txt",
-    ]
+    assert sorted(nc.files.uploads) == ["docs/a (redacted 2).txt", "docs/a (redacted).txt"]
 
 
 def _copies_tree():
@@ -577,35 +574,69 @@ def test_original_is_fresh_when_any_of_its_copies_is_newer():
     """The edited original is compared against every redacted copy, not only against the first one."""
     nc, docs = _copies_tree()
     report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
-    assert [result.node.name for result in report.skipped] == ["a (redacted 2).txt", "a.txt"]
-    # The original is neither read nor redacted again; only the stale copy is older than the original.
-    assert nc.files.downloads == ["docs/a (redacted).txt"]
-    assert list(nc.files.uploads) == ["docs/a (redacted 3).txt"]
+    assert [result.node.name for result in report.skipped] == ["a (redacted 2).txt", "a (redacted).txt", "a.txt"]
+    # Nothing is read: the stale first copy is left alone like the current one.
+    assert nc.files.downloads == []
+    assert nc.files.uploads == {}
 
 
-def test_repeated_runs_after_an_edit(monkeypatch):
-    """Edit, run, run again: the third run finds the original and the current copies up to date.
+def _never_called(text: str) -> str:
+    pytest.fail(f"redact was called with {len(text)} characters")
 
-    Only the first copy, made before the edit, is still older than the original and is redacted again.
-    """
+
+def test_redacted_copies_are_skipped_whatever_their_age():
+    """A redacted copy is never redacted again; the stale one and the current one are told apart in the report."""
+    nc, docs = _copies_tree()
+    report = redact_folder(nc, docs, redact=_never_called, max_bytes=NO_LIMIT)
+    skipped = {result.node.name: result.detail for result in report.skipped}
+    assert skipped == {
+        "a (redacted 2).txt": "a redacted copy is never redacted again",
+        "a (redacted).txt": "a redacted copy is never redacted again",
+        "a.txt": "a redacted copy is already up to date",
+    }
+    assert nc.files.downloads == []
+    assert nc.files.uploads == {}
+
+
+def test_a_file_named_like_a_copy_is_skipped_even_without_an_original():
+    """A file called "report (redacted).txt" from the start is taken for what its name says."""
+    nc, docs = build_folder_tree([("docs/report (redacted).txt", b"named like a copy", "text/plain")])
+    for _run in (1, 2):
+        report = redact_folder(nc, docs, redact=_never_called, max_bytes=NO_LIMIT)
+        assert [(result.node.name, result.status) for result in report.results] == [("report (redacted).txt", "skipped")]
+    assert nc.files.downloads == []
+    assert nc.files.uploads == {}
+
+
+def test_repeated_runs_after_an_edit_add_no_copy():
+    """Edit, run, run again: the third and the fourth run add no copy and read no file."""
     nc = FakeNc()
     docs = nc.files.add_dir("docs")
     nc.files.add_file("docs/a.txt", b"one", "text/plain")
-    monkeypatch.setattr(batch, "redact_text", fake_redact)
     for run in (1, 2):
         if run == 2:
             edited_at = FakeFiles.UPLOADED_AT + datetime.timedelta(seconds=30)
             nc.files.add_file("docs/a.txt", b"one edited", "text/plain", last_modified=edited_at)
         redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
-    nc.files.downloads.clear()
-    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
-    assert [result.node.name for result in report.skipped] == ["a (redacted 2).txt", "a (redacted 3).txt", "a.txt"]
-    assert nc.files.downloads == ["docs/a (redacted).txt"]
-    assert sorted(nc.files.uploads) == [
-        "docs/a (redacted 2).txt",
-        "docs/a (redacted 3).txt",
-        "docs/a (redacted 4).txt",
-        "docs/a (redacted).txt",
+    after_the_edit = sorted(nc.files.uploads)
+    assert after_the_edit == ["docs/a (redacted 2).txt", "docs/a (redacted).txt"]
+    for _run in (3, 4):
+        nc.files.downloads.clear()
+        report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+        assert nc.files.downloads == []
+        assert sorted(nc.files.uploads) == after_the_edit
+        assert [result.node.name for result in report.skipped] == ["a (redacted 2).txt", "a (redacted).txt", "a.txt"]
+
+
+def test_single_file_action_on_a_copy_is_a_no_op_whatever_its_age(monkeypatch):
+    nc, _docs = _copies_tree()
+    monkeypatch.setattr(main, "redact_text", fake_redact)
+    for name in ("docs/a (redacted).txt", "docs/a (redacted 2).txt"):
+        main.redact_file(nc, action_info(nc.files.nodes[name], "file"))
+    assert nc.files.uploads == {}
+    assert nc.notifications.created == [
+        ("A redacted copy of a (redacted).txt is already up to date", ""),
+        ("A redacted copy of a (redacted 2).txt is already up to date", ""),
     ]
 
 
