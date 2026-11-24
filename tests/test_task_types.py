@@ -59,6 +59,26 @@ def test_contains_pii_returns_false_for_clean_text(set_engines) -> None:
     assert main.TASK_HANDLERS["text_anonymizer:contains_pii"]({"input": "Nothing to see."}) == {"contains_pii": "false"}
 
 
+def test_contains_pii_does_not_count_dates_or_urls(set_engines) -> None:
+    cases = [
+        ("The weather is fine today.", "DATE_TIME", "today"),
+        ("The meeting is on Monday.", "DATE_TIME", "Monday"),
+        ("See https://example.com/report for details.", "URL", "https://example.com/report"),
+    ]
+    for whole, entity_type, value in cases:
+        set_engines([entity(entity_type, value, whole)])
+        assert anonymizer.contains_pii(whole) is False, whole
+        assert main.TASK_HANDLERS["text_anonymizer:contains_pii"]({"input": whole}) == {"contains_pii": "false"}
+
+
+def test_contains_pii_counts_locations(set_engines) -> None:
+    set_engines([entity("LOCATION", "Springfield", "Our office is in Springfield.")])
+    assert anonymizer.contains_pii("Our office is in Springfield.") is True
+    assert main.TASK_HANDLERS["text_anonymizer:contains_pii"]({"input": "Our office is in Springfield."}) == {
+        "contains_pii": "true"
+    }
+
+
 def test_redact_handler_without_mode_is_unchanged(set_engines) -> None:
     set_engines(TEXT_RESULTS)
     output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT})

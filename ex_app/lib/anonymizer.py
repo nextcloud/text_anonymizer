@@ -15,6 +15,8 @@ ProgressCallback = Callable[[float], None]
 _LOCK = threading.Lock()
 _ENGINES: tuple[AnalyzerEngine, AnonymizerEngine] | None = None
 _KEEP_OPERATORS = {"DEFAULT": OperatorConfig("keep")}
+# Entity types that turn up in ordinary sentences without identifying anyone, so contains_pii does not count them.
+NON_IDENTIFYING_TYPES = frozenset({"DATE_TIME", "URL"})
 # Analysis time grows faster than text length, and spaCy rejects texts over 1,000,000 characters.
 CHUNK_SIZE = 10_000
 
@@ -75,13 +77,14 @@ def detect_pii(text: str, language: str = "en", on_progress: ProgressCallback | 
 
 
 def contains_pii(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> bool:
-    """Return whether any PII entity was found in ``text``.
+    """Return whether ``text`` holds an entity that can identify a person.
 
-    Overlap resolution can only drop entities, never add them, so any raw analyzer result means
-    PII is present and the (slower) resolution pass is skipped.
+    Entity types in ``NON_IDENTIFYING_TYPES`` do not count. Overlap resolution can only drop
+    entities, never add them, so scanning the raw analyzer results is enough and the (slower)
+    resolution pass is skipped.
     """
     analyzer, _ = _get_engines()
-    return bool(_analyze(analyzer, text, language, on_progress))
+    return any(r.entity_type not in NON_IDENTIFYING_TYPES for r in _analyze(analyzer, text, language, on_progress))
 
 
 def redact_text(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:
