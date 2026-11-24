@@ -242,13 +242,12 @@ def notify_batch_summary(nc: NextcloudApp, report: BatchReport) -> None:
             f"No redactable text files were found in {report.folder_name}.",
         )
         return
-    message = f"{report.processed_count} files processed, {len(report.redacted)} redacted, {len(report.failed)} failed."
-    if report.skipped:
-        skipped = ", ".join(f"{result.node.name} ({result.detail})" for result in report.skipped)
-        message += f" Skipped: {skipped}."
-    if report.failed:
-        failed = ", ".join(f"{result.node.name} ({result.detail})" for result in report.failed)
-        message += f" Failed: {failed}."
+    # Notification bodies are fetched by every client of the user, so they carry counts only;
+    # the server log names the files that were skipped or failed.
+    message = (
+        f"{report.processed_count} files processed, {len(report.redacted)} redacted, "
+        f"{len(report.failed)} failed, {len(report.skipped)} skipped."
+    )
     nc.notifications.create(f"Redacted text files in {report.folder_name}", message)
 
 

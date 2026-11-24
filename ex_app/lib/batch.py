@@ -210,6 +210,7 @@ def collect_text_files(nc: NextcloudApp, folder: FsNode, max_bytes: int) -> tupl
                     files.append(node)
                 else:
                     oversize.append(FileResult(node, STATUS_SKIPPED, reason))
+                    LOGGER.warning("Skipped %s: %s", node.user_path, reason)
     files.sort(key=lambda node: node.user_path)
     oversize.sort(key=lambda result: result.node.user_path)
     return files, oversize

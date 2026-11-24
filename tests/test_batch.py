@@ -275,7 +275,8 @@ def test_partial_failure_names_failed_file_and_keeps_other_copies():
     assert len(nc.files.uploads) == 2
 
 
-def test_batch_summary_notification_counts_and_reasons():
+def test_batch_summary_notification_counts_and_no_file_names():
+    """The notification counts; it does not list files, as a long list would grow with every skipped file."""
     nc, docs = build_folder_tree(
         [
             ("docs/01-good.txt", b"one", "text/plain"),
@@ -288,9 +289,21 @@ def test_batch_summary_notification_counts_and_reasons():
     assert len(nc.notifications.created) == 1
     subject, message = nc.notifications.created[0]
     assert subject == "Redacted text files in docs"
-    assert "2 files processed, 1 redacted, 1 failed." in message
-    assert "02-bad.txt (not a UTF-8 encoded text file)" in message
-    assert "03-huge.txt (larger than" in message
+    assert message == "2 files processed, 1 redacted, 1 failed, 1 skipped."
+
+
+def test_folder_batch_logs_each_oversize_file(caplog):
+    """The notification no longer names the skipped files, so the log names each one with its reason."""
+    nc, docs = build_folder_tree(
+        [
+            ("docs/small.txt", b"ok", "text/plain"),
+            ("docs/huge.txt", b"x" * 100, "text/plain"),
+        ]
+    )
+    with caplog.at_level(logging.WARNING, logger="batch"):
+        redact_folder(nc, docs, redact=fake_redact, max_bytes=50)
+    assert "Skipped docs/huge.txt: larger than 50 bytes" in caplog.text
+    assert "docs/small.txt" not in caplog.text
 
 
 def test_size_guard_skips_oversize_file_with_warning():
