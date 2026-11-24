@@ -60,6 +60,7 @@ It uses [Presidio](https://presidio.dataprivacystack.org/) under the hood, with 
 ## Requirements
 
 - Nextcloud server version 31 or later with [AppAPI](https://github.com/nextcloud/app_api) and a configured deploy daemon.
+- The image is built for CPU; a GPU is not supported.
 
 ## Development
 
