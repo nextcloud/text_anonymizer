@@ -363,6 +363,24 @@ def test_max_file_bytes_env_var(monkeypatch):
     assert max_file_bytes() == DEFAULT_MAX_FILE_BYTES
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", DEFAULT_MAX_FILE_BYTES),
+        (" ", DEFAULT_MAX_FILE_BYTES),
+        ("0", DEFAULT_MAX_FILE_BYTES),
+        (" 2048 ", 2048),
+        ("+2048", 2048),
+        ("2048.5", DEFAULT_MAX_FILE_BYTES),
+        ("0x1000", DEFAULT_MAX_FILE_BYTES),
+    ],
+)
+def test_max_file_bytes_reads_the_variable_as_an_integer(monkeypatch, raw, expected):
+    """Surrounding spaces and a sign are read as int() reads them; a fraction or a hexadecimal value is not a size."""
+    monkeypatch.setenv("TEXT_ANONYMIZER_MAX_FILE_BYTES", raw)
+    assert max_file_bytes() == expected
+
+
 def test_setting_description_names_the_default_of_the_code():
     """The description the admin reads names the default the code falls back to, in bytes and in MiB."""
     info_xml = (Path(__file__).resolve().parents[1] / "appinfo" / "info.xml").read_text(encoding="utf-8")
