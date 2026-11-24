@@ -52,9 +52,9 @@ class FakeFiles:
         self.downloads: list[str] = []
         self._next_id = 1000
 
-    def add_dir(self, user_path: str) -> FsNode:
+    def add_dir(self, user_path: str, permissions: str = "RGDNVCK") -> FsNode:
         dir_path = user_path.rstrip("/") + "/"
-        node = FsNode(f"files/admin/{dir_path}", fileid=self._next_id, mimetype="httpd/unix-directory")
+        node = FsNode(f"files/admin/{dir_path}", fileid=self._next_id, mimetype="httpd/unix-directory", permissions=permissions)
         self._next_id += 1
         self.nodes[dir_path] = node
         return node
@@ -510,6 +510,35 @@ def test_single_file_action_skips_oversize_file(monkeypatch):
     assert nc.notifications.created == [
         ("Could not redact big.txt", "The file is larger than 50 bytes and was skipped.")
     ]
+
+
+def test_folder_action_does_not_start_where_no_copy_can_be_written(monkeypatch, caplog):
+    """A folder in which no file can be created is refused before the first download: one notification, one log line."""
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs", permissions="SGDN")
+    nc.files.add_file("docs/a.txt", b"one", "text/plain")
+    nc.files.add_file("docs/b.txt", b"two", "text/plain")
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    monkeypatch.setattr(batch, "redact_text", fake_redact)
+    with caplog.at_level(logging.WARNING, logger="main"):
+        main.redact_files("admin", [action_info(docs, "folder")])
+    assert nc.files.downloads == []
+    assert nc.files.uploads == {}
+    assert nc.notifications.created == [
+        ("Could not redact text files in docs", "No file can be created in this folder, so no redacted copy can be written.")
+    ]
+    assert "Not redacting docs/: no file can be created in this folder" in caplog.text
+
+
+def test_folder_action_runs_where_a_copy_can_be_written(monkeypatch):
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs", permissions="RGDNVCK")
+    nc.files.add_file("docs/a.txt", b"one", "text/plain")
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    monkeypatch.setattr(batch, "redact_text", fake_redact)
+    main.redact_files("admin", [action_info(docs, "folder")])
+    assert list(nc.files.uploads) == ["docs/a (redacted).txt"]
+    assert [subject for subject, _message in nc.notifications.created] == ["Redacted text files in docs"]
 
 
 def test_files_action_accepts_the_folder_file_type(monkeypatch):

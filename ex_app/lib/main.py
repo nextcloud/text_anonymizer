@@ -224,6 +224,14 @@ def redact_folder_action(nc: NextcloudApp, dir_info: ActionFileInfo) -> None:
         if node is None or not node.is_dir:
             nc.notifications.create(f"Could not redact text files in {dir_info.name}", "The folder could not be found.")
             return
+        # The permissions of this folder are known here; a subfolder in which nothing can be created fails file by file.
+        if not node.is_creatable:
+            LOGGER.warning("Not redacting %s: no file can be created in this folder", node.user_path)
+            nc.notifications.create(
+                f"Could not redact text files in {dir_info.name}",
+                "No file can be created in this folder, so no redacted copy can be written.",
+            )
+            return
         # A Files action has no task ID, so task progress cannot be reported through TaskProcessing;
         # each file is reported through the progress callback instead. Files actions also have no
         # language input surface, so the batch runs the default English pipeline.
