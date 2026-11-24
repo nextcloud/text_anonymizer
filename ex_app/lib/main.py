@@ -14,6 +14,15 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from anonymizer import detect_pii, redact_text
+from config import (
+    ADMIN_CONFIG_KEYS,
+    DEFAULT_SCORE_THRESHOLD,
+    ENV_ALLOW_PATTERNS,
+    ENV_IGNORED_ENTITY_TYPES,
+    ENV_SCORE_THRESHOLD,
+    Settings,
+    apply_admin_config,
+)
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +40,7 @@ from nc_py_api.ex_app.providers.task_processing import (
     TaskProcessingProvider,
     TaskType,
 )
+from nc_py_api.ex_app.ui.settings import SettingsField, SettingsFieldType, SettingsForm
 from nc_py_api.files import ActionFileInfo, ActionFileInfoEx
 
 LOGGER = logging.getLogger(__name__)
@@ -93,6 +103,115 @@ TASK_HANDLERS = {
     REDACT_PII_TASK_TYPE.id: redact_text,
 }
 
+# The declarative settings section AppAPI ships for ExApps ("ExApps Settings").
+ADMIN_SETTINGS_SECTION_ID = "declarative_settings"
+# The Nextcloud settings UI submits the form id with the app id prefix stripped, so an id
+# containing the prefix would make every real-UI save address an unregistered form and the
+# saved value would be silently dropped.
+ADMIN_SETTINGS_FORM_ID = "detection_settings"
+
+
+def admin_settings_form() -> SettingsForm:
+    """The admin-editable detection settings form (AppAPI declarative settings).
+
+    Field ids are the ``oc_appconfig_ex`` keys the pipeline resolves per task and file
+    action, so a value saved here overrides the environment variable of the same name (see
+    the config module). Field defaults show the built-in defaults: an environment override
+    stays in force until an admin saves a value, and the form cannot see the container
+    environment.
+    """
+    return SettingsForm(
+        id=ADMIN_SETTINGS_FORM_ID,
+        section_type="admin",
+        section_id=ADMIN_SETTINGS_SECTION_ID,
+        title="Text Anonymizer",
+        description=(
+            "Detection settings for every task and file action. A value saved here overrides"
+            " the environment variable of the same name and applies to work started after the"
+            " save; an empty field keeps the environment value. The defaults shown are the"
+            " built-in defaults, not the current environment overrides."
+        ),
+        fields=[
+            SettingsField(
+                id=ENV_SCORE_THRESHOLD,
+                title="Detection confidence threshold",
+                type=SettingsFieldType.NUMBER,
+                default=DEFAULT_SCORE_THRESHOLD,
+                description=(
+                    "Minimum confidence score, from 0.0 to 1.0, for an entity to be reported"
+                    " or redacted. Recognizer scores cluster in coarse bands (checksum-backed"
+                    " recognizers such as IBANs and credit cards near 1.0, NER models near"
+                    " 0.85, URLs and phone numbers around 0.4 to 0.6), so raising the"
+                    " threshold drops whole entity types at a step instead of weakening"
+                    " detections one by one. Default: 0.5."
+                ),
+            ),
+            SettingsField(
+                id=ENV_IGNORED_ENTITY_TYPES,
+                title="Ignored entity types",
+                type=SettingsFieldType.TEXT,
+                default="",
+                description=(
+                    "Comma-separated entity types that are never reported or redacted, for"
+                    " example URL,DATE_TIME. Default: none."
+                ),
+                placeholder="URL,DATE_TIME",
+            ),
+            SettingsField(
+                id=ENV_ALLOW_PATTERNS,
+                title="Allow-list patterns",
+                type=SettingsFieldType.TEXT,
+                default="",
+                description=(
+                    "Regular expressions, one per line; a detected entity whose text matches,"
+                    " or that sits inside a match, is kept as-is, for example public company"
+                    " names. Default: none."
+                ),
+                placeholder="Nextcloud GmbH",
+            ),
+        ],
+    )
+
+
+def _env_settings() -> Settings:
+    """The environment layer of the detection settings; an invalid value falls back to the
+    built-in defaults with a warning instead of failing every task."""
+    try:
+        return Settings.from_env()
+    except ValueError as e:
+        LOGGER.warning("%s; the built-in defaults are in force", e)
+        return Settings()
+
+
+def _default_or_none(settings: Settings) -> Settings | None:
+    """None when the resolution equals the built-in defaults, so the detection pipeline runs
+    unfiltered instead of applying a no-op filter pass."""
+    return None if settings == Settings() else settings
+
+
+async def _resolve_task_settings(nc: AsyncNextcloudApp) -> Settings | None:
+    """Detection settings for one task: environment values with admin-saved appconfig
+    layered on top; a failed server read keeps the environment values."""
+    settings = _env_settings()
+    try:
+        records = await nc.appconfig_ex.get_values(list(ADMIN_CONFIG_KEYS))
+        settings = apply_admin_config(settings, {record.key: record.value for record in records})
+    except Exception as e:
+        LOGGER.warning("Admin detection settings could not be read, environment values stay in force: %s", e)
+    return _default_or_none(settings)
+
+
+def _resolve_action_settings(nc: NextcloudApp) -> Settings | None:
+    """Detection settings for a Files action, resolved through ``nc`` like the task settings."""
+    settings = _env_settings()
+    try:
+        records = nc.appconfig_ex.get_values(list(ADMIN_CONFIG_KEYS))
+        settings = apply_admin_config(settings, {record.key: record.value for record in records})
+    except Exception as e:
+        LOGGER.warning("Admin detection settings could not be read, environment values stay in force: %s", e)
+    return _default_or_none(settings)
+
+
 # Set by `enabled_handler`, which runs in a worker thread.
 APP_ENABLED = threading.Event()
 # Set when Nextcloud announces a new task (Nextcloud 33+) and on shutdown.
@@ -126,8 +245,9 @@ async def process_task(nc: AsyncNextcloudApp, task: dict[str, Any]) -> None:
 
     try:
         handler = TASK_HANDLERS[task["type"]]
+        settings = await _resolve_task_settings(nc)
         # Presidio is CPU-bound, so it runs in a worker thread to keep the event loop responsive.
-        output = await asyncio.to_thread(handler, task["input"]["input"], on_progress=on_progress)
+        output = await asyncio.to_thread(handler, task["input"]["input"], on_progress=on_progress, settings=settings)
     except Exception as e:
         await nc.log(LogLvl.ERROR, f"Failed to process task {task['id']}: {e}")
         await nc.providers.task_processing.report_result(
@@ -209,7 +329,12 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
             nc.notifications.create(f"Could not redact {node.name}", "The file is not a UTF-8 encoded text file.")
             return
         copy_path = redacted_copy_path(nc, node.user_path)
-        nc.files.upload(copy_path, redact_text(text))
+        settings = _resolve_action_settings(nc)
+        if settings is None:
+            redacted = redact_text(text)
+        else:
+            redacted = redact_text(text, settings=settings)
+        nc.files.upload(copy_path, redacted)
         nc.notifications.create(f"Redacted copy of {node.name} saved as {posixpath.basename(copy_path)}")
     except Exception as e:
         nc.log(LogLvl.ERROR, f"Failed to redact file {file_info.fileId}: {e}")
@@ -249,6 +374,9 @@ def enabled_handler(enabled: bool, nc: NextcloudApp) -> str:
                 icon="img/icon.svg",
                 order=REDACT_FILE_ACTION_ORDER,
             )
+            # Registering the form on every enable also refreshes its schema after upgrades
+            # (a re-registration edits the existing form in place).
+            nc.ui.settings.register_form(admin_settings_form())
             APP_ENABLED.set()
         else:
             APP_ENABLED.clear()

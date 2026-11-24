@@ -30,6 +30,25 @@ It uses [Presidio](https://presidio.dataprivacystack.org/) under the hood, with 
   possible, and the task progress is reported to Nextcloud after each chunk.
 - **Picks up tasks quickly.** On Nextcloud 33 and later, Nextcloud notifies the app as soon as a new task is
   scheduled. On older versions, the app checks for new tasks every 5 seconds.
+- **Configurable detection.** Administrators can set a confidence threshold, ignore entity types and allow-list
+  patterns under Administration settings (ExApps Settings), with environment-variable fallbacks. See
+  [Configuration](#configuration).
+
+## Configuration
+
+Detection is configured by administrators under Administration settings (ExApps Settings). Each
+setting has an environment-variable fallback with the same name: a value saved by an administrator
+overrides the environment variable, and the environment variable overrides the built-in default.
+
+- `TEXT_ANONYMIZER_SCORE_THRESHOLD` — minimum confidence score (0.0 to 1.0) for an entity to be reported or
+  redacted. Default: `0.5`.
+- `TEXT_ANONYMIZER_IGNORED_ENTITY_TYPES` — comma-separated entity types that are never reported or redacted,
+  for example `URL,DATE_TIME`. Default: none.
+- `TEXT_ANONYMIZER_ALLOW_PATTERNS` — regular expressions, one per line; a detected entity whose text matches,
+  or that sits inside a match, is kept as-is, for example public company names. Default: none.
+
+Entity types follow Presidio's names, e.g. `PERSON`, `URL` or `DATE_TIME` (see Presidio's
+[list of supported entities](https://presidio.dataprivacystack.org/supported_entities/)).
 
 ## Screenshots
 
@@ -55,7 +74,6 @@ It uses [Presidio](https://presidio.dataprivacystack.org/) under the hood, with 
   takes several seconds longer while the spaCy model loads.
 - **Entities split across chunks may be missed.** In texts longer than 10,000 characters, an entity that happens to
   span a chunk boundary may not be detected. Chunks are split at line breaks or spaces to make this rare.
-- **No settings.** There is no admin or user configuration yet, e.g. for choosing languages or entity types.
 
 ## Requirements
 
