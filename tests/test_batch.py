@@ -73,8 +73,11 @@ class FakeFiles:
         self.contents[user_path] = content
         return node
 
-    def listdir(self, path: FsNode) -> list[FsNode]:
-        return [node for user_path, node in self.nodes.items() if _parent_path(user_path) == path.user_path]
+    def listdir(self, path: FsNode | str) -> list[FsNode]:
+        # As in nc_py_api, a folder is given as a node or as a user path; ``""`` is the root.
+        parent = (path.user_path if isinstance(path, FsNode) else path).strip("/")
+        folder = f"{parent}/" if parent else ""
+        return [node for user_path, node in self.nodes.items() if _parent_path(user_path) == folder]
 
     def by_id(self, file_id) -> FsNode | None:
         for node in self.nodes.values():
@@ -94,7 +97,9 @@ class FakeFiles:
     def upload(self, path: str, content) -> FsNode:
         data = content.encode() if isinstance(content, str) else content
         self.uploads[path] = data
-        return self.add_file(path, data, "text/plain", last_modified=self.UPLOADED_AT)
+        # Each upload is a minute later than the previous one, as on a real storage.
+        uploaded_at = self.UPLOADED_AT + datetime.timedelta(minutes=len(self.uploads) - 1)
+        return self.add_file(path, data, "text/plain", last_modified=uploaded_at)
 
 
 class FakeNotifications:
@@ -162,12 +167,13 @@ class FakeNc:
         self.logs.append((level, message))
 
 
-def build_folder_tree(files: list[tuple[str, bytes, str]]) -> tuple[FakeNc, FsNode]:
+def build_folder_tree(files: list[tuple]) -> tuple[FakeNc, FsNode]:
+    """Nodes from ``(path, content, mimetype[, last_modified])`` under ``docs``, which has the subfolder ``sub``."""
     nc = FakeNc()
     docs = nc.files.add_dir("docs")
     nc.files.add_dir("docs/sub")
-    for user_path, content, mimetype in files:
-        nc.files.add_file(user_path, content, mimetype)
+    for user_path, content, mimetype, *last_modified in files:
+        nc.files.add_file(user_path, content, mimetype, *last_modified)
     return nc, docs
 
 
@@ -350,13 +356,32 @@ def test_folder_batch_ignores_binary_files():
             ("docs/sub/image.jpeg", b"\xff\xd8", "image/jpeg"),
         ]
     )
-    files, oversize = collect_text_files(nc, docs, NO_LIMIT)
+    files, oversize, _copies = collect_text_files(nc, docs, NO_LIMIT)
     assert [node.user_path for node in files] == ["docs/readme.txt"]
     assert oversize == []
     report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
     assert report.processed_count == 1
     assert nc.files.downloads == ["docs/readme.txt"]
     assert list(nc.files.uploads) == ["docs/readme (redacted).txt"]
+
+
+def test_collect_text_files_indexes_the_redacted_copies_by_original():
+    nc, docs = build_folder_tree(
+        [
+            ("docs/a.txt", b"one", "text/plain"),
+            ("docs/a (redacted).txt", b"copy", "text/plain"),
+            ("docs/a (redacted 2).txt", b"copy", "text/plain"),
+            ("docs/b (redacted).md", b"copy of another file", "text/markdown"),
+            ("docs/sub/a (redacted).txt", b"copy in another folder", "text/plain"),
+            ("docs/report (redacted final).txt", b"not a redacted copy", "text/plain"),
+        ]
+    )
+    _files, _oversize, copies = collect_text_files(nc, docs, NO_LIMIT)
+    assert {original: [copy.user_path for copy in found] for original, found in sorted(copies.items())} == {
+        "docs/a.txt": ["docs/a (redacted).txt", "docs/a (redacted 2).txt"],
+        "docs/b.md": ["docs/b (redacted).md"],
+        "docs/sub/a.txt": ["docs/sub/a (redacted).txt"],
+    }
 
 
 @pytest.mark.parametrize(
@@ -488,6 +513,65 @@ def test_edited_original_gets_a_refreshed_copy(monkeypatch):
         "docs/a (redacted 3).txt",
         "docs/a (redacted).txt",
     ]
+
+
+def _copies_tree():
+    """A file edited after its first redaction, a second redaction newer than the edit, and the stale first copy."""
+    stale_at = FakeFiles.UPLOADED_AT
+    edited_at = stale_at + datetime.timedelta(minutes=1)
+    current_at = stale_at + datetime.timedelta(minutes=2)
+    nc, docs = build_folder_tree(
+        [
+            ("docs/a.txt", b"edited", "text/plain", edited_at),
+            ("docs/a (redacted).txt", b"stale copy", "text/plain", stale_at),
+            ("docs/a (redacted 2).txt", b"current copy", "text/plain", current_at),
+        ]
+    )
+    return nc, docs
+
+
+def test_original_is_fresh_when_any_of_its_copies_is_newer():
+    """The edited original is compared against every redacted copy, not only against the first one."""
+    nc, docs = _copies_tree()
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.node.name for result in report.skipped] == ["a (redacted 2).txt", "a.txt"]
+    # The original is neither read nor redacted again; only the stale copy is older than the original.
+    assert nc.files.downloads == ["docs/a (redacted).txt"]
+    assert list(nc.files.uploads) == ["docs/a (redacted 3).txt"]
+
+
+def test_repeated_runs_after_an_edit(monkeypatch):
+    """Edit, run, run again: the third run finds the original and the current copies up to date.
+
+    Only the first copy, made before the edit, is still older than the original and is redacted again.
+    """
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs")
+    nc.files.add_file("docs/a.txt", b"one", "text/plain")
+    monkeypatch.setattr(batch, "redact_text", fake_redact)
+    for run in (1, 2):
+        if run == 2:
+            edited_at = FakeFiles.UPLOADED_AT + datetime.timedelta(seconds=30)
+            nc.files.add_file("docs/a.txt", b"one edited", "text/plain", last_modified=edited_at)
+        redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    nc.files.downloads.clear()
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.node.name for result in report.skipped] == ["a (redacted 2).txt", "a (redacted 3).txt", "a.txt"]
+    assert nc.files.downloads == ["docs/a (redacted).txt"]
+    assert sorted(nc.files.uploads) == [
+        "docs/a (redacted 2).txt",
+        "docs/a (redacted 3).txt",
+        "docs/a (redacted 4).txt",
+        "docs/a (redacted).txt",
+    ]
+
+
+def test_single_file_action_is_a_no_op_when_a_later_copy_is_current(monkeypatch):
+    nc, _docs = _copies_tree()
+    monkeypatch.setattr(main, "redact_text", fake_redact)
+    main.redact_file(nc, action_info(nc.files.nodes["docs/a.txt"], "file"))
+    assert nc.files.uploads == {}
+    assert nc.notifications.created == [("A redacted copy of a.txt is already up to date", "")]
 
 
 def test_single_file_action_is_a_no_op_when_the_copy_is_fresh(monkeypatch):

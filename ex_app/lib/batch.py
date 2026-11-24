@@ -7,7 +7,7 @@ import logging
 import os
 import posixpath
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from anonymizer import redact_text
@@ -128,15 +128,33 @@ def _original_path(user_path: str) -> str:
     return posixpath.join(directory, f"{REDACTED_SUFFIX_RE.sub('', stem)}{ext}")
 
 
-def redacted_copy_is_fresh(nc: NextcloudApp, node: FsNode) -> bool:
+def is_redacted_copy(user_path: str) -> bool:
+    """Whether the file at ``user_path`` is named like a redacted copy, e.g. ``notes (redacted 2).txt``."""
+    return REDACTED_SUFFIX_RE.search(posixpath.splitext(posixpath.basename(user_path))[0]) is not None
+
+
+def redacted_copies_by_original(nodes: Iterable[FsNode]) -> dict[str, list[FsNode]]:
+    """The redacted copies among ``nodes``, keyed by the path of the original each was made from."""
+    copies: dict[str, list[FsNode]] = {}
+    for node in nodes:
+        if not node.is_dir and is_redacted_copy(node.user_path):
+            copies.setdefault(_original_path(node.user_path), []).append(node)
+    return copies
+
+
+def redacted_copy_is_fresh(
+    nc: NextcloudApp, node: FsNode, copies: dict[str, list[FsNode]] | None = None
+) -> bool:
     """Whether ``node`` is already redacted and up to date, so an action on it is a no-op.
 
-    A regular file is fresh when its redacted copy exists and is newer than the file itself.
+    A regular file is fresh when one of its redacted copies is newer than the file itself.
     A file that is itself a redacted copy is fresh when it is newer than the original it was
     made from; editing the original makes the copy stale and the next run redacts both again.
+
+    ``copies`` is the index of a folder listing (see ``redacted_copies_by_original``); without it,
+    the folder of ``node`` is listed.
     """
-    canonical = canonical_redacted_copy_path(node.user_path)
-    if canonical == node.user_path:
+    if is_redacted_copy(node.user_path):
         try:
             original = nc.files.by_path(_original_path(node.user_path))
         except NextcloudException as e:
@@ -144,14 +162,9 @@ def redacted_copy_is_fresh(nc: NextcloudApp, node: FsNode) -> bool:
                 return False
             raise
         return node.info.last_modified > original.info.last_modified
-    try:
-        copy = nc.files.by_path(canonical)
-    except NextcloudException as e:
-        # WebDAV lookups raise a plain NextcloudException for a missing path (see path_exists).
-        if e.status_code == 404:
-            return False
-        raise
-    return copy.info.last_modified > node.info.last_modified
+    if copies is None:
+        copies = redacted_copies_by_original(nc.files.listdir(posixpath.dirname(node.user_path)))
+    return any(copy.info.last_modified > node.info.last_modified for copy in copies.get(node.user_path, []))
 
 
 @dataclass
@@ -191,17 +204,24 @@ class BatchReport:
         return bool(self.results)
 
 
-def collect_text_files(nc: NextcloudApp, folder: FsNode, max_bytes: int) -> tuple[list[FsNode], list[FileResult]]:
-    """Recursively collect text files under ``folder`` as ``(processable, oversize-skipped)``.
+def collect_text_files(
+    nc: NextcloudApp, folder: FsNode, max_bytes: int
+) -> tuple[list[FsNode], list[FileResult], dict[str, list[FsNode]]]:
+    """Recursively collect text files under ``folder`` as ``(processable, oversize-skipped, redacted-copies)``.
 
     Non-text files are ignored outright; text files over ``max_bytes`` are reported so each can be warned about.
+    ``redacted-copies`` holds every redacted copy found, keyed by the path of its original.
     """
     files: list[FsNode] = []
     oversize: list[FileResult] = []
+    copies: dict[str, list[FsNode]] = {}
     folders = [folder]
     while folders:
         current = folders.pop()
-        for node in nc.files.listdir(current):
+        nodes = nc.files.listdir(current)
+        for original, found in redacted_copies_by_original(nodes).items():
+            copies.setdefault(original, []).extend(found)
+        for node in nodes:
             if node.is_dir:
                 folders.append(node)
             elif is_text_mime(node.info.mimetype):
@@ -213,7 +233,7 @@ def collect_text_files(nc: NextcloudApp, folder: FsNode, max_bytes: int) -> tupl
                     LOGGER.warning("Skipped %s: %s", node.user_path, reason)
     files.sort(key=lambda node: node.user_path)
     oversize.sort(key=lambda result: result.node.user_path)
-    return files, oversize
+    return files, oversize, copies
 
 
 def redact_file_copy(nc: NextcloudApp, node: FsNode, redact: RedactFn) -> str:
@@ -242,13 +262,13 @@ def redact_folder(
         redact = redact_text
     limit = max_file_bytes() if max_bytes is None else max_bytes
     report = BatchReport(folder_name=folder.name)
-    files, oversize = collect_text_files(nc, folder, limit)
+    files, oversize, copies = collect_text_files(nc, folder, limit)
     report.results.extend(oversize)
     total = len(files)
     for index, node in enumerate(files, 1):
         if on_progress is not None:
             on_progress(index, total, node.name)
-        if redacted_copy_is_fresh(nc, node):
+        if redacted_copy_is_fresh(nc, node, copies):
             report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
             continue
         try:
