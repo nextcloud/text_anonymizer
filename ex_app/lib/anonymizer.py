@@ -74,6 +74,16 @@ def detect_pii(text: str, language: str = "en", on_progress: ProgressCallback | 
     return "\n".join(f"{entity_type}: {value}" for entity_type, value in entities)
 
 
+def contains_pii(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> bool:
+    """Return whether any PII entity was found in ``text``.
+
+    Overlap resolution can only drop entities, never add them, so any raw analyzer result means
+    PII is present and the (slower) resolution pass is skipped.
+    """
+    analyzer, _ = _get_engines()
+    return bool(_analyze(analyzer, text, language, on_progress))
+
+
 def redact_text(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:
     """Replace every PII entity in ``text`` with a placeholder naming its type, e.g. ``<PERSON>``."""
     analyzer, anonymizer = _get_engines()
