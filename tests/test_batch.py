@@ -518,6 +518,7 @@ def test_files_action_accepts_the_folder_file_type(monkeypatch):
     docs = nc.files.add_dir("docs")
     nc.files.add_file("docs/a.txt", b"hi", "text/plain")
     monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    monkeypatch.setattr(batch, "redact_text", fake_redact)
     main.redact_files("admin", [action_info(docs, "folder")])
     assert "docs/a (redacted).txt" in nc.files.uploads
 
