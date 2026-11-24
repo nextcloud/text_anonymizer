@@ -3,6 +3,9 @@
 
 """Tests for the TaskProcessing task types and their output formats."""
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 from presidio_analyzer import RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
@@ -90,6 +93,35 @@ def test_detect_handler_reports_output_slot(set_engines) -> None:
     set_engines(TEXT_RESULTS)
     output = main.TASK_HANDLERS["text_anonymizer:detect_pii"]({"input": TEXT})
     assert output == {"output": anonymizer.detect_pii(TEXT)}
+
+
+class FakeTaskProcessing:
+    def __init__(self) -> None:
+        self.results: list[dict] = []
+
+    async def set_progress(self, task_id: int, progress: float) -> None:
+        pass
+
+    async def report_result(self, task_id: int, output=None, error_message=None) -> None:
+        self.results.append({"task_id": task_id, "output": output, "error_message": error_message})
+
+
+class FakeNc:
+    def __init__(self) -> None:
+        self.providers = SimpleNamespace(task_processing=FakeTaskProcessing())
+
+    async def log(self, level: int, message: str) -> None:
+        pass
+
+
+def test_process_task_reports_handler_output_unwrapped(set_engines) -> None:
+    set_engines([])
+    nc = FakeNc()
+    task = {"id": 42, "type": "text_anonymizer:contains_pii", "input": {"input": "Nothing to see."}}
+    asyncio.run(main.process_task(nc, task))
+    assert nc.providers.task_processing.results == [
+        {"task_id": 42, "output": {"contains_pii": "false"}, "error_message": None}
+    ]
 
 
 def test_task_types_are_registered() -> None:

@@ -171,7 +171,7 @@ async def process_task(nc: AsyncNextcloudApp, task: dict[str, Any]) -> None:
             task["id"], error_message=str(e), user_facing_error_message="The text could not be processed."
         )
         return
-    await nc.providers.task_processing.report_result(task["id"], {"output": output})
+    await nc.providers.task_processing.report_result(task["id"], output)
 
 
 async def process_tasks() -> None:
