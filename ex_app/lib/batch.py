@@ -17,7 +17,7 @@ from nc_py_api.files import FsNode
 LOGGER = logging.getLogger(__name__)
 
 # Redacting a file of this size takes minutes and would monopolize the worker, so larger files are skipped.
-DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MiB
 MAX_FILE_BYTES_ENV = "TEXT_ANONYMIZER_MAX_FILE_BYTES"
 
 REDACTED_SUFFIX_RE = re.compile(r" \(redacted(?: \d+)?\)$")
