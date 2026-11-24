@@ -268,10 +268,10 @@ def redact_folder(
     for index, node in enumerate(files, 1):
         if on_progress is not None:
             on_progress(index, total, node.name)
-        if redacted_copy_is_fresh(nc, node, copies):
-            report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
-            continue
         try:
+            if redacted_copy_is_fresh(nc, node, copies):
+                report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
+                continue
             detail = redact_file_copy(nc, node, redact)
         except UnicodeDecodeError:
             report.results.append(FileResult(node, STATUS_FAILED, "not a UTF-8 encoded text file"))

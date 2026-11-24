@@ -281,6 +281,31 @@ def test_partial_failure_names_failed_file_and_keeps_other_copies():
     assert len(nc.files.uploads) == 2
 
 
+@pytest.mark.parametrize("status_code", [403, 423, 500])
+def test_a_file_whose_freshness_check_fails_is_reported_and_the_run_goes_on(status_code):
+    """The lookup that decides whether a copy is up to date can fail like any other request to the server."""
+    nc, docs = build_folder_tree(
+        [
+            ("docs/01-good.txt", b"one", "text/plain"),
+            ("docs/02-locked (redacted).txt", b"copy", "text/plain"),
+            ("docs/03-good.txt", b"three", "text/plain"),
+        ]
+    )
+    by_path = nc.files.by_path
+
+    def failing_by_path(user_path):
+        if user_path == "docs/02-locked.txt":
+            raise NextcloudException(status_code, "Server error")
+        return by_path(user_path)
+
+    nc.files.by_path = failing_by_path
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.node.name for result in report.redacted] == ["01-good.txt", "03-good.txt"]
+    assert [(result.node.name, result.detail) for result in report.failed] == [
+        ("02-locked (redacted).txt", f"[{status_code}] Server error")
+    ]
+
+
 def test_batch_summary_notification_counts_and_no_file_names():
     """The notification counts; it does not list files, as a long list would grow with every skipped file."""
     nc, docs = build_folder_tree(
