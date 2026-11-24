@@ -4,6 +4,7 @@
 """Tests for the TaskProcessing task types and their output formats."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -226,3 +227,68 @@ def test_contains_pii_task_type_says_true_false() -> None:
     assert "true/false" in main.CONTAINS_PII_TASK_TYPE.description
     assert "yes/no" not in main.CONTAINS_PII_TASK_TYPE.output_shape[0].description
     assert '"true" or "false"' in main.CONTAINS_PII_TASK_TYPE.output_shape[0].description
+
+
+def test_pseudonymize_mode_numbers_unique_entities(set_engines) -> None:
+    set_engines(TEXT_RESULTS)
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT, "mode": "pseudonymize"})
+    assert output["output"] == "<PERSON_1> met <PERSON_2> at <EMAIL_ADDRESS_1>."
+    assert json.loads(output["mapping"]) == {
+        "PERSON_1": "Alice",
+        "PERSON_2": "Bob",
+        "EMAIL_ADDRESS_1": "bob@example.com",
+    }
+
+
+def test_pseudonymize_mode_reuses_placeholders_for_repeated_values(set_engines) -> None:
+    text = "Bob met Alice. Bob left."
+    set_engines(
+        [
+            RecognizerResult(entity_type="PERSON", start=0, end=3, score=0.9),
+            RecognizerResult(entity_type="PERSON", start=8, end=13, score=0.9),
+            RecognizerResult(entity_type="PERSON", start=15, end=18, score=0.9),
+        ]
+    )
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+    assert output["output"] == "<PERSON_1> met <PERSON_2>. <PERSON_1> left."
+    assert json.loads(output["mapping"]) == {"PERSON_1": "Bob", "PERSON_2": "Alice"}
+
+
+def test_pseudonymize_mode_resolves_overlapping_entities(set_engines) -> None:
+    text = "John Smith"
+    set_engines(
+        [
+            RecognizerResult(entity_type="LOCATION", start=0, end=4, score=0.8),
+            RecognizerResult(entity_type="PERSON", start=0, end=10, score=0.9),
+        ]
+    )
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+    assert output["output"] == "<PERSON_1>"
+    assert json.loads(output["mapping"]) == {"PERSON_1": "John Smith"}
+
+
+def test_pseudonymize_mode_without_pii_reports_empty_mapping(set_engines) -> None:
+    set_engines([])
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": "Nothing here.", "mode": "pseudonymize"})
+    assert output == {"output": "Nothing here.", "mapping": "{}"}
+
+
+def test_redact_handler_with_explicit_mode_reports_no_mapping(set_engines) -> None:
+    set_engines(TEXT_RESULTS)
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT, "mode": "redact"})
+    assert output == {"output": "<PERSON> met <PERSON> at <EMAIL_ADDRESS>."}
+
+
+def test_redact_task_mode_and_mapping_shapes() -> None:
+    provider = main.REDACT_PII_PROVIDER
+    assert [(d.name, d.shape_type) for d in provider.optional_input_shape] == [
+        ("mode", ShapeType.ENUM),
+    ]
+    assert [(v.name, v.value) for v in provider.optional_input_shape_enum_values["mode"]] == [
+        ("Redact", "redact"),
+        ("Pseudonymize", "pseudonymize"),
+    ]
+    assert provider.optional_input_shape_defaults == {"mode": "redact"}
+    assert [(d.name, d.shape_type) for d in provider.optional_output_shape] == [("mapping", ShapeType.TEXT)]
+    assert [(d.name, d.shape_type) for d in main.REDACT_PII_TASK_TYPE.output_shape] == [("output", ShapeType.TEXT)]
+    assert [(d.name, d.shape_type) for d in main.REDACT_PII_TASK_TYPE.input_shape] == [("input", ShapeType.TEXT)]
