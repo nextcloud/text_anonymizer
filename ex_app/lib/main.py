@@ -139,11 +139,13 @@ def admin_settings_form() -> SettingsForm:
                 default=DEFAULT_SCORE_THRESHOLD,
                 description=(
                     "Minimum confidence score, from 0.0 to 1.0, for an entity to be reported"
-                    " or redacted. Recognizer scores cluster in coarse bands (checksum-backed"
-                    " recognizers such as IBANs and credit cards near 1.0, NER models near"
-                    " 0.85, URLs and phone numbers around 0.4 to 0.6), so raising the"
-                    " threshold drops whole entity types at a step instead of weakening"
-                    " detections one by one. Default: 0.5."
+                    " or redacted. Until a value is saved here or set in the environment,"
+                    " entities are reported regardless of confidence; the pre-filled 0.5 is"
+                    " a suggestion, not an active filter. Recognizer scores cluster in"
+                    " coarse bands (checksum-backed recognizers such as IBANs and credit"
+                    " cards near 1.0, NER models near 0.85, URLs and phone numbers around"
+                    " 0.4 to 0.6), so raising the threshold drops whole entity types at a"
+                    " step instead of weakening detections one by one."
                 ),
             ),
             SettingsField(

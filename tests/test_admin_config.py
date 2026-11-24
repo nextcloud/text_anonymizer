@@ -65,9 +65,23 @@ def test_precedence_admin_beats_env_beats_default_per_knob() -> None:
 def test_defaults_apply_without_env_or_admin() -> None:
     settings = Settings.from_env({})
     assert settings == Settings()
-    assert settings.score_threshold == DEFAULT_SCORE_THRESHOLD
+    assert settings.score_threshold is None
     assert settings.ignored_entity_types == frozenset()
     assert settings.allow_patterns == ()
+
+
+def test_no_score_threshold_until_the_threshold_itself_is_set() -> None:
+    """Only a threshold saved by the admin or set in the environment filters by score.
+
+    Saving an unrelated knob must not silently start dropping low-score detections.
+    """
+    results = [_result("PHONE_NUMBER", 0, 12, 0.40)]
+    settings = Settings(allow_patterns=("ZZZ-never-matches",))
+    assert filter_results(results, "a phone 555-0134", settings) == results
+    settings = Settings(ignored_entity_types=frozenset({"URL"}))
+    assert filter_results(results, "a phone 555-0134", settings) == results
+    assert Settings.from_env({}).score_threshold is None
+    assert Settings.from_env({ENV_SCORE_THRESHOLD: "0.7"}).score_threshold == 0.7
 
 
 def test_unset_or_empty_admin_key_keeps_the_env_value() -> None:

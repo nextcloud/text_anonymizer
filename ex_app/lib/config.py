@@ -3,10 +3,11 @@
 
 """Detection settings: built-in defaults, environment overrides and admin appconfig overrides.
 
-Values are resolved lowest to highest: built-in default, ``TEXT_ANONYMIZER_*`` environment
-variable, admin value saved through the declarative settings form (``oc_appconfig_ex``). The
-declarative form stores by field id, so the form field ids and the appconfig keys are the
-environment variable names (see :data:`ADMIN_CONFIG_KEYS`).
+Values are resolved lowest to highest: built-in default (no threshold, nothing ignored,
+nothing allow-listed), ``TEXT_ANONYMIZER_*`` environment variable, admin value saved
+through the declarative settings form (``oc_appconfig_ex``). The declarative form stores
+by field id, so the form field ids and the appconfig keys are the environment variable
+names (see :data:`ADMIN_CONFIG_KEYS`).
 
 :func:`filter_results` applies a resolved :class:`Settings` to analyzer results, so the
 detection pipeline (anonymizer module), the evaluation harness (evals/) and any task wiring
@@ -27,8 +28,9 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger("text_anonymizer.config")
 
-#: Built-in detection confidence threshold: results with a lower Presidio score are dropped.
-#: Equivalent to passing ``score_threshold`` to ``AnalyzerEngine.analyze()``.
+#: The confidence threshold suggested in the settings form. No threshold is in force until
+#: the administrator saves one or the environment sets ``TEXT_ANONYMIZER_SCORE_THRESHOLD``;
+#: this value is what the form pre-fills, not an implicit filter.
 DEFAULT_SCORE_THRESHOLD = 0.5
 
 ENV_SCORE_THRESHOLD = "TEXT_ANONYMIZER_SCORE_THRESHOLD"
@@ -79,9 +81,14 @@ def parse_allow_patterns(raw: str) -> tuple[tuple[str, re.Pattern[str]], ...]:
 
 @dataclass(frozen=True)
 class Settings:
-    """Resolved detection knobs; see the module docstring for the precedence order."""
+    """Resolved detection knobs; see the module docstring for the precedence order.
 
-    score_threshold: float = DEFAULT_SCORE_THRESHOLD
+    ``score_threshold`` is ``None`` until the threshold itself is set through the
+    environment or by the administrator: other knobs being active must not silently
+    start dropping low-score detections.
+    """
+
+    score_threshold: float | None = None
     ignored_entity_types: frozenset[str] = frozenset()
     allow_patterns: tuple[str, ...] = ()
 
@@ -94,7 +101,7 @@ class Settings:
         """
         env = os.environ if env is None else env
         raw = env.get(ENV_SCORE_THRESHOLD)
-        threshold = DEFAULT_SCORE_THRESHOLD
+        threshold = None
         if raw:
             threshold = _parse_score_threshold(raw)
             if threshold is None:
@@ -146,19 +153,20 @@ def _widened_span(text: str, start: int, end: int) -> str:
 def filter_results(results: list[RecognizerResult], text: str, settings: Settings) -> list[RecognizerResult]:
     """Drop results the settings suppress, keeping order.
 
-    A result is dropped when its score is below ``score_threshold`` (the same predicate as
-    ``AnalyzerEngine.analyze(score_threshold=...)``), when its entity type is ignored, or when
-    its matched text is allow-listed (e.g. a public company name that must never be redacted).
-    An allow-list pattern suppresses a result when it matches the span text, the span text
-    widened to word boundaries, or a region of the analyzed text that contains the span; the
-    last two tolerate recognizer boundary drift around an allow-listed phrase, such as a
-    detector bounding only "Nextcloud" inside "Nextcloud GmbH".
+    A result is dropped when its entity type is ignored, or when its matched text is
+    allow-listed (e.g. a public company name that must never be redacted); a score
+    threshold drops low-scoring results only when the threshold itself is set (see
+    :class:`Settings`). An allow-list pattern suppresses a result when it matches the
+    span text, the span text widened to word boundaries, or a region of the analyzed
+    text that contains the span; the last two tolerate recognizer boundary drift around
+    an allow-listed phrase, such as a detector bounding only "Nextcloud" inside
+    "Nextcloud GmbH".
     """
     allow = parse_allow_patterns("\n".join(settings.allow_patterns))
     allowed_regions = [match.span() for _, pattern in allow for match in pattern.finditer(text)]
     kept = []
     for result in results:
-        if result.score < settings.score_threshold:
+        if settings.score_threshold is not None and result.score < settings.score_threshold:
             continue
         if result.entity_type in settings.ignored_entity_types:
             continue

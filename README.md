@@ -41,7 +41,8 @@ setting has an environment-variable fallback with the same name: a value saved b
 overrides the environment variable, and the environment variable overrides the built-in default.
 
 - `TEXT_ANONYMIZER_SCORE_THRESHOLD` — minimum confidence score (0.0 to 1.0) for an entity to be reported or
-  redacted. Default: `0.5`.
+  redacted. Until this or the admin setting is set, entities are reported regardless of confidence; 0.5 is the
+  value suggested in the form.
 - `TEXT_ANONYMIZER_IGNORED_ENTITY_TYPES` — comma-separated entity types that are never reported or redacted,
   for example `URL,DATE_TIME`. Default: none.
 - `TEXT_ANONYMIZER_ALLOW_PATTERNS` — regular expressions, one per line; a detected entity whose text matches,

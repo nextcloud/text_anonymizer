@@ -54,7 +54,7 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 			<variable>
 				<name>TEXT_ANONYMIZER_SCORE_THRESHOLD</name>
 				<display-name>Detection confidence threshold</display-name>
-				<description>Optional. Environment fallback for the admin setting of the same name (Administration settings, ExApps Settings): a value an admin saves there overrides this one. Minimum confidence score (0.0 to 1.0) for an entity to be reported or redacted. Default: 0.5.</description>
+				<description>Optional. Environment fallback for the admin setting of the same name (Administration settings, ExApps Settings): a value an admin saves there overrides this one. Minimum confidence score (0.0 to 1.0) for an entity to be reported or redacted; until this or the admin setting is set, entities are reported regardless of confidence. Suggested value: 0.5.</description>
 			</variable>
 			<variable>
 				<name>TEXT_ANONYMIZER_IGNORED_ENTITY_TYPES</name>
