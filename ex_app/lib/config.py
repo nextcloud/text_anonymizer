@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import re._parser as _sre_parse
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -61,11 +62,49 @@ def parse_ignored_entity_types(raw: str) -> frozenset[str]:
     return frozenset(item.strip().upper() for item in raw.split(",") if item.strip())
 
 
+def _has_nested_quantifier(pattern: str) -> bool:
+    """Whether ``pattern`` has a quantified group that itself contains a quantifier.
+
+    Heuristic, not a proof: it refuses the classic catastrophic-backtracking shapes
+    (``(a+)+``, ``(.*)*``, ``(\\w+\\s?)+``) and everything shaped like them, and lets
+    ordinary patterns through. It may refuse a bounded, harmless pattern that happens
+    to nest quantifiers; Python's ``re`` has no time bound, so refusing is the safe side.
+    """
+    def is_repeat(op: object) -> bool:
+        return getattr(op, "name", str(op)) in ("MAX_REPEAT", "MIN_REPEAT")
+
+    def contains_repeat(nodes) -> bool:
+        for op, av in nodes:
+            if is_repeat(op):
+                return True
+            name = getattr(op, "name", str(op))
+            if name == "SUBPATTERN" and contains_repeat(av[-1]):
+                return True
+            if name == "BRANCH" and any(contains_repeat(branch) for branch in av[1]):
+                return True
+        return False
+
+    def walk(nodes) -> bool:
+        for op, av in nodes:
+            name = getattr(op, "name", str(op))
+            if is_repeat(op) and (contains_repeat(av[-1]) or walk(av[-1])):
+                return True
+            if name == "SUBPATTERN" and walk(av[-1]):
+                return True
+            if name == "BRANCH" and any(walk(branch) for branch in av[1]):
+                return True
+        return False
+
+    return walk(_sre_parse.parse(pattern))
+
+
 def parse_allow_patterns(raw: str) -> tuple[tuple[str, re.Pattern[str]], ...]:
     """Split a newline-separated regular-expression list into ``(source, compiled)`` pairs.
 
     Patterns are validated here: an invalid pattern is dropped with a warning instead of
-    failing every later analysis, and the remaining patterns stay in force.
+    failing every later analysis, and so is a pattern whose shape can hang analysis (a
+    quantified group containing a quantifier, see :func:`_has_nested_quantifier`); the
+    remaining patterns stay in force.
     """
     patterns = []
     for line in raw.splitlines():
@@ -73,9 +112,14 @@ def parse_allow_patterns(raw: str) -> tuple[tuple[str, re.Pattern[str]], ...]:
         if not source:
             continue
         try:
-            patterns.append((source, re.compile(source)))
+            compiled = re.compile(source)
         except re.error as e:
             LOGGER.warning("Ignoring invalid allow-list pattern %r: %s", source, e)
+            continue
+        if _has_nested_quantifier(source):
+            LOGGER.warning("Ignoring allow-list pattern %r: nested quantifiers can hang analysis on hostile text", source)
+            continue
+        patterns.append((source, compiled))
     return tuple(patterns)
 
 
