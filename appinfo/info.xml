@@ -22,7 +22,7 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 
 ### Limitations
 
-- English only.
+- Currently supports English and German only.
 - Detection is not perfect: some sensitive text may be missed and some harmless text may be redacted. Check the output before relying on it.
 - Redaction cannot be undone, and the detection task's output contains the sensitive values it found.
 - The Files action only supports UTF-8 encoded plain text files, not documents such as ODT, DOCX or PDF.

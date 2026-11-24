@@ -19,6 +19,7 @@ help:
 	@echo "  Please use \`make <target>\` where <target> is one of"
 	@echo " "
 	@echo "  build-push        builds CPU images and uploads them to ghcr.io"
+	@echo "  dev-models        installs the spaCy models the engines use into the dev venv"
 	@echo " "
 	@echo "  > Next commands are only for the dev environment with nextcloud-docker-dev!"
 	@echo "  > They must be run from the host you are developing on, not in a Nextcloud container!"
@@ -46,6 +47,11 @@ help:
 build-push:
     # docker login ghcr.io
 	DOCKER_BUILDKIT=1 docker buildx build --push --platform linux/arm64/v8,linux/amd64 --tag ghcr.io/nextcloud/$(APP_ID):latest .
+
+.PHONY: dev-models
+dev-models:
+	poetry run python -m spacy download en_core_web_lg
+	poetry run python -m spacy download de_core_news_lg
 
 .PHONY: run31
 run31:

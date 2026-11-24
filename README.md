@@ -41,8 +41,8 @@ It uses [Presidio](https://presidio.dataprivacystack.org/) under the hood, with 
 
 ## Limitations
 
-- **English only.** Texts in other languages are analyzed with the English model and recognizers, so many entities
-  will be missed.
+- **Currently supports English and German only.** Texts in other languages are analyzed with the English model and
+  recognizers, so many entities will be missed.
 - **Detection is not perfect.** Presidio combines pattern matching with a statistical model, so it can miss entities
   and flag text that is not sensitive. Check the output before relying on it, especially for sensitive data.
 - **Redaction cannot be undone.** Every entity of the same type gets the same placeholder, so the output does not show
