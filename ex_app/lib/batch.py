@@ -47,7 +47,6 @@ STATUS_SKIPPED = "skipped"
 
 
 def max_file_bytes() -> int:
-    """Largest file that is redacted, from ``TEXT_ANONYMIZER_MAX_FILE_BYTES`` (default 10 MB)."""
     raw = os.environ.get(MAX_FILE_BYTES_ENV, "")
     if not raw:
         return DEFAULT_MAX_FILE_BYTES
