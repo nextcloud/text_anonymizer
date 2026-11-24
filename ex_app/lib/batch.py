@@ -37,6 +37,8 @@ TEXT_MIMES = frozenset(
     }
 )
 TEXT_MIME_SUFFIXES = ("+json", "+xml", "+yaml", "+yml")
+# An SVG ends in "+xml" but is a drawing: redaction would rewrite its namespace URL and path data.
+NON_TEXT_MIMES = frozenset({"image/svg+xml"})
 
 RedactFn = Callable[[str], str]
 ProgressCallback = Callable[[int, int, str], None]
@@ -79,6 +81,8 @@ def oversize_detail(size: int, max_bytes: int | None = None) -> str | None:
 def is_text_mime(mimetype: str) -> bool:
     """Whether a DAV-reported MIME type holds redactable text (text/* plus structured-text types)."""
     mime = (mimetype or "").lower()
+    if mime in NON_TEXT_MIMES:
+        return False
     return mime.startswith("text/") or mime in TEXT_MIMES or mime.endswith(TEXT_MIME_SUFFIXES)
 
 

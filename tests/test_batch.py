@@ -358,10 +358,24 @@ def test_is_text_mime_accepts_text_like(mimetype):
 @pytest.mark.parametrize(
     "mimetype",
     ["", "image/png", "image/jpeg", "application/pdf", "application/octet-stream",
-     "application/vnd.oasis.opendocument.text", "httpd/unix-directory"],
+     "application/vnd.oasis.opendocument.text", "httpd/unix-directory", "image/svg+xml"],
 )
 def test_is_text_mime_rejects_binary(mimetype):
     assert not is_text_mime(mimetype)
+
+
+def test_folder_batch_leaves_svg_images_alone():
+    nc, docs = build_folder_tree(
+        [
+            ("docs/readme.txt", b"text", "text/plain"),
+            ("docs/logo.svg", b'<svg xmlns="http://www.w3.org/2000/svg"/>', "image/svg+xml"),
+        ]
+    )
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.node.name for result in report.redacted] == ["readme.txt"]
+    assert report.skipped == [] and report.failed == []
+    assert nc.files.downloads == ["docs/readme.txt"]
+    assert list(nc.files.uploads) == ["docs/readme (redacted).txt"]
 
 
 def test_folder_action_dispatches_directories_to_batch(monkeypatch):
