@@ -54,7 +54,7 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 			<variable>
 				<name>TEXT_ANONYMIZER_MAX_FILE_BYTES</name>
 				<display-name>Maximum file size</display-name>
-				<description>Optional. Largest text file the Files actions redact, in bytes; larger files are skipped with a notification. Default: 10485760 (10 MB).</description>
+				<description>Optional. Skip redacting files larger than a certain size, in bytes. Default: 10485760 (10 MiB).</description>
 			</variable>
 		</environment-variables>
 		<routes>

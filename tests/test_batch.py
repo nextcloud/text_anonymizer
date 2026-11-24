@@ -6,7 +6,9 @@
 import datetime
 import logging
 import posixpath
+import re
 import threading
+from pathlib import Path
 
 import pytest
 from nc_py_api import NextcloudException
@@ -16,6 +18,7 @@ import batch
 import main
 from batch import (
     DEFAULT_MAX_FILE_BYTES,
+    MAX_FILE_BYTES_ENV,
     collect_text_files,
     is_text_mime,
     max_file_bytes,
@@ -314,6 +317,14 @@ def test_max_file_bytes_env_var(monkeypatch):
     assert max_file_bytes() == DEFAULT_MAX_FILE_BYTES
     monkeypatch.setenv("TEXT_ANONYMIZER_MAX_FILE_BYTES", "-5")
     assert max_file_bytes() == DEFAULT_MAX_FILE_BYTES
+
+
+def test_setting_description_names_the_default_of_the_code():
+    """The description the admin reads names the default the code falls back to, in bytes and in MiB."""
+    info_xml = (Path(__file__).resolve().parents[1] / "appinfo" / "info.xml").read_text(encoding="utf-8")
+    description = re.search(rf"<name>{MAX_FILE_BYTES_ENV}</name>.*?<description>(.*?)</description>", info_xml, re.DOTALL)
+    assert description is not None, "the setting is not declared in appinfo/info.xml"
+    assert f"Default: {DEFAULT_MAX_FILE_BYTES} ({DEFAULT_MAX_FILE_BYTES // (1024 * 1024)} MiB)" in description.group(1)
 
 
 def test_folder_batch_ignores_binary_files():
