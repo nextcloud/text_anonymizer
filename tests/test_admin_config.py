@@ -283,6 +283,14 @@ def test_info_xml_declares_the_environment_fallbacks() -> None:
         assert declared[key] == by_id[key], key
 
 
+def test_info_xml_declares_no_variable_the_code_does_not_read() -> None:
+    """Every declared variable must be a knob the pipeline resolves; extras are dead UI."""
+    tree = ET.parse(Path(__file__).resolve().parents[1] / "appinfo" / "info.xml")
+    variables = tree.getroot().find("external-app").find("environment-variables")
+    declared = {v.findtext("name") for v in variables.findall("variable")}
+    assert declared == set(ADMIN_CONFIG_KEYS)
+
+
 def test_readme_documents_every_admin_setting() -> None:
     """The README configuration list stays in sync with the settings the form exposes."""
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")

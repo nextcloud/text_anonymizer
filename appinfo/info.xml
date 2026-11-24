@@ -52,11 +52,6 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 		</docker-install>
 		<environment-variables>
 			<variable>
-				<name>TEXT_ANONYMIZER_ENGINE</name>
-				<display-name>Detection engine</display-name>
-				<description>Optional. Detection engine: gliner (the zero-shot PII model, the default) or spacy (the NER fallback engine).</description>
-			</variable>
-			<variable>
 				<name>TEXT_ANONYMIZER_SCORE_THRESHOLD</name>
 				<display-name>Detection confidence threshold</display-name>
 				<description>Optional. Environment fallback for the admin setting of the same name (Administration settings, ExApps Settings): a value an admin saves there overrides this one. Minimum confidence score (0.0 to 1.0) for an entity to be reported or redacted. Default: 0.5.</description>
