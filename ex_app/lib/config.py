@@ -63,6 +63,15 @@ def _parse_score_threshold(raw: str) -> float | None:
     return value
 
 
+def _parse_layered_threshold(raw: str, owner: str) -> float | None:
+    """The threshold in ``raw``, or None after a warning that names ``owner`` (the environment or
+    the admin form) when it is invalid: the lower level then stays in force."""
+    threshold = _parse_score_threshold(raw)
+    if threshold is None:
+        LOGGER.warning("Ignoring invalid %s value for %s: %r (expected 0.0 to 1.0)", owner, ENV_SCORE_THRESHOLD, raw)
+    return threshold
+
+
 def parse_ignored_entity_types(raw: str) -> frozenset[str]:
     """Split a comma-separated entity-type list, dropping empty items.
 
@@ -159,18 +168,15 @@ class Settings:
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         """Build settings from ``env`` (defaults to the process environment).
 
-        Raises ``ValueError`` on an invalid threshold, unlike the fail-soft admin layering: a
-        container misconfiguration should surface at startup, not silently weaken detection.
+        Each setting is read on its own and an invalid one falls back to its default with a
+        warning naming the variable, like the admin layering: a bad value in the environment
+        never hides the other settings. An invalid threshold leaves the threshold unset, so
+        it filters nothing instead of silently dropping detections.
         """
         env = os.environ if env is None else env
         raw = env.get(ENV_SCORE_THRESHOLD)
-        threshold = None
-        if raw:
-            threshold = _parse_score_threshold(raw)
-            if threshold is None:
-                raise ValueError(f"Invalid value for {ENV_SCORE_THRESHOLD}: {raw!r} (expected 0.0 to 1.0)")
         return cls(
-            score_threshold=threshold,
+            score_threshold=_parse_layered_threshold(raw, "environment") if raw else None,
             ignored_entity_types=parse_ignored_entity_types(env.get(ENV_IGNORED_ENTITY_TYPES, "")),
             allow_patterns=tuple(source for source, _ in parse_allow_patterns(env.get(ENV_ALLOW_PATTERNS, ""))),
         )
@@ -186,10 +192,8 @@ def apply_admin_config(base: Settings, values: Mapping[str, str]) -> Settings:
     overrides: dict[str, object] = {}
     raw = values.get(ENV_SCORE_THRESHOLD)
     if raw:
-        threshold = _parse_score_threshold(raw)
-        if threshold is None:
-            LOGGER.warning("Ignoring invalid admin value for %s: %r (expected 0.0 to 1.0)", ENV_SCORE_THRESHOLD, raw)
-        else:
+        threshold = _parse_layered_threshold(raw, "admin")
+        if threshold is not None:
             overrides["score_threshold"] = threshold
     raw = values.get(ENV_IGNORED_ENTITY_TYPES)
     if raw is not None and raw.strip():

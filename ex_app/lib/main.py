@@ -4,6 +4,7 @@
 """ExApp server providing TaskProcessing tasks and a Files action for detecting and redacting PII."""
 
 import asyncio
+import functools
 import logging
 import os
 import posixpath
@@ -49,6 +50,8 @@ LOGGER = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     set_handlers(app, enabled_handler, trigger_handler=trigger_handler)
+    # The environment layer is read here, at startup, so a bad value is reported once and not on the first task.
+    _env_settings()
     if NextcloudApp().enabled_state:
         APP_ENABLED.set()
     worker = asyncio.create_task(process_tasks())
@@ -179,14 +182,12 @@ def admin_settings_form() -> SettingsForm:
     )
 
 
+@functools.cache
 def _env_settings() -> Settings:
-    """The environment layer of the detection settings; an invalid value falls back to the
-    built-in defaults with a warning instead of failing every task."""
-    try:
-        return Settings.from_env()
-    except ValueError as e:
-        LOGGER.warning("%s; the built-in defaults are in force", e)
-        return Settings()
+    """The environment layer of the detection settings, read once per process: the environment of
+    the container does not change while the app runs. An invalid value falls back to the
+    default of its setting with a warning, instead of failing every task."""
+    return Settings.from_env()
 
 
 def _default_or_none(settings: Settings) -> Settings | None:

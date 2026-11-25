@@ -91,10 +91,14 @@ def test_unset_or_empty_admin_key_keeps_the_env_value() -> None:
     assert apply_admin_config(base, {ENV_SCORE_THRESHOLD: "   "}).score_threshold == 0.7
 
 
-@pytest.mark.parametrize("bad", ["abc", "1.5", "-0.1", "nan", "inf"])
-def test_invalid_env_threshold_raises_at_startup(bad: str) -> None:
-    with pytest.raises(ValueError, match=ENV_SCORE_THRESHOLD):
-        Settings.from_env({ENV_SCORE_THRESHOLD: bad})
+@pytest.mark.parametrize("bad", ["0,5", "abc", "1.5", "-0.1", "nan", "inf"])
+def test_invalid_env_threshold_fails_soft_and_keeps_the_other_settings(caplog, bad: str) -> None:
+    """One bad value in the environment hides none of the others: the threshold stays unset and filters nothing."""
+    env = {ENV_SCORE_THRESHOLD: bad, ENV_IGNORED_ENTITY_TYPES: "URL", ENV_ALLOW_PATTERNS: "Jane Doe"}
+    with caplog.at_level(logging.WARNING, logger="text_anonymizer.config"):
+        settings = Settings.from_env(env)
+    assert settings == Settings(ignored_entity_types=frozenset({"URL"}), allow_patterns=("Jane Doe",))
+    assert ENV_SCORE_THRESHOLD in caplog.text
 
 
 @pytest.mark.parametrize("bad", ["abc", "1.5", "-0.1", "nan", "inf"])
