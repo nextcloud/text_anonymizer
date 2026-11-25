@@ -16,6 +16,7 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 
 - **Detect sensitive text**: a TaskProcessing task that lists each distinct PII entity found in a text.
 - **Redact sensitive text**: a TaskProcessing task that replaces each PII entity with a placeholder naming its type, e.g. `Call John at 555-123-4567` becomes `Call <PERSON> at <PHONE_NUMBER>`.
+- **Contains sensitive text**: a TaskProcessing task that answers only "true" or "false" to whether a text holds personal data. Dates and URLs do not count for it, as they turn up in ordinary sentences.
 - **Redact text files**: a "Redact text" action in Files that saves a redacted copy next to the original text file, which is left unchanged.
 - Detects names, email addresses, phone numbers, locations, dates, credit card numbers, IBANs, IP addresses, URLs and more.
 - Handles long texts and reports task progress.

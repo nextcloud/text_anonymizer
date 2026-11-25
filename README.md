@@ -13,12 +13,15 @@ It uses [Presidio](https://presidio.dataprivacystack.org/) under the hood, with 
 
 ## Features
 
-- **Two TaskProcessing task types.** Other apps and users can call these through the Nextcloud TaskProcessing API,
+- **Three TaskProcessing task types.** Other apps and users can call these through the Nextcloud TaskProcessing API,
   for example from the Assistant:
-  - **Detect sensitive text** (`core:text2text:detect_pii`) lists each distinct PII entity found in the input as a
+  - **Detect sensitive text** (`text_anonymizer:detect_pii`) lists each distinct PII entity found in the input as a
     `TYPE: value` line, in order of first appearance. The output is empty if nothing was found.
-  - **Redact sensitive text** (`core:text2text:redact_pii`) replaces each PII entity with a placeholder naming its
+  - **Redact sensitive text** (`text_anonymizer:redact_pii`) replaces each PII entity with a placeholder naming its
     type, e.g. `Call John at 555-123-4567` becomes `Call <PERSON> at <PHONE_NUMBER>`.
+  - **Contains sensitive text?** (`text_anonymizer:contains_pii`) answers only `true` or `false`, for flows that
+    need to know whether a text is safe to pass on. Dates and URLs do not count for it, as they turn up in ordinary
+    sentences; the other two tasks still list and replace them.
 - **"Redact text" action in Files.** Text files have a "Redact text" entry in their action menu. It saves a redacted
   copy next to the original, e.g. `notes (redacted).txt` (then `notes (redacted 2).txt`, and so on), and leaves the
   original file unchanged. A notification tells the user when the copy is ready or why it failed. Files are read and
