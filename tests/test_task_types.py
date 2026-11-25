@@ -151,7 +151,7 @@ def test_detect_pii_and_redact_text_reach_every_chunk(monkeypatch: pytest.Monkey
     assert len(analyzer.chunks) == 4
 
 
-def test_redact_handler_without_mode_is_unchanged(set_engines) -> None:
+def test_redact_handler_reports_output_slot(set_engines) -> None:
     set_engines(TEXT_RESULTS)
     output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT})
     assert output == {"output": anonymizer.redact_text(TEXT)}
