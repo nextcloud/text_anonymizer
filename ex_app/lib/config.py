@@ -19,15 +19,25 @@ from __future__ import annotations
 import logging
 import os
 import re
-import re._parser as _sre_parse
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
+
+import regex
 
 if TYPE_CHECKING:
     from presidio_analyzer import RecognizerResult
 
 LOGGER = logging.getLogger("text_anonymizer.config")
+
+#: Wall-clock seconds one allow-list pattern may spend on one analysis. A sound pattern needs
+#: microseconds there; one that needs more, such as a quantified group that backtracks on long
+#: text, is ignored for that analysis, so its entities are treated as not allow-listed.
+ALLOW_PATTERN_TIME_BUDGET = 0.25
+
+#: Allow-list patterns that ran out of time, so that the warning is logged once per process.
+_TIMED_OUT_PATTERNS: set[str] = set()
 
 #: The confidence threshold suggested in the settings form. No threshold is in force until
 #: the administrator saves one or the environment sets ``TEXT_ANONYMIZER_SCORE_THRESHOLD``;
@@ -62,64 +72,68 @@ def parse_ignored_entity_types(raw: str) -> frozenset[str]:
     return frozenset(item.strip().upper() for item in raw.split(",") if item.strip())
 
 
-def _has_nested_quantifier(pattern: str) -> bool:
-    """Whether ``pattern`` has a quantified group that itself contains a quantifier.
+#: A counted repeat: ``{m}``, ``{m,}``, ``{,n}`` or ``{m,n}``.
+_COUNTED_REPEAT = re.compile(r"\{\d*(,\d*)?\}")
 
-    Heuristic, not a proof: it refuses the classic catastrophic-backtracking shapes
-    (``(a+)+``, ``(.*)*``, ``(\\w+\\s?)+``) and everything shaped like them, and lets
-    ordinary patterns through. It may refuse a bounded, harmless pattern that happens
-    to nest quantifiers; Python's ``re`` has no time bound, so refusing is the safe side.
+
+def _reads_as_fuzzy_match(source: str) -> bool:
+    """Whether ``source`` has a ``{`` outside a character class that opens no counted repeat.
+
+    Python's ``re`` reads such a brace as a literal, but the ``regex`` engine, which runs the
+    allow-list for its time bound, reads what follows it as a fuzzy-match constraint, so the
+    pattern would then keep texts it does not name.
     """
-    def is_repeat(op: object) -> bool:
-        return getattr(op, "name", str(op)) in ("MAX_REPEAT", "MIN_REPEAT")
-
-    def contains_repeat(nodes) -> bool:
-        for op, av in nodes:
-            if is_repeat(op):
-                return True
-            name = getattr(op, "name", str(op))
-            if name == "SUBPATTERN" and contains_repeat(av[-1]):
-                return True
-            if name == "BRANCH" and any(contains_repeat(branch) for branch in av[1]):
-                return True
-        return False
-
-    def walk(nodes) -> bool:
-        for op, av in nodes:
-            name = getattr(op, "name", str(op))
-            if is_repeat(op) and (contains_repeat(av[-1]) or walk(av[-1])):
-                return True
-            if name == "SUBPATTERN" and walk(av[-1]):
-                return True
-            if name == "BRANCH" and any(walk(branch) for branch in av[1]):
-                return True
-        return False
-
-    return walk(_sre_parse.parse(pattern))
+    pos = 0
+    while pos < len(source):
+        char = source[pos]
+        if char == "\\":
+            pos += 2
+        elif char == "[":
+            end = pos + 1 + (source[pos + 1 : pos + 2] == "^")
+            end += source[end : end + 1] == "]"  # a leading ] is a member of the class, not its end
+            while end < len(source) and source[end] != "]":
+                end += 2 if source[end] == "\\" else 1
+            pos = end + 1
+        elif char == "{" and not _COUNTED_REPEAT.match(source, pos):
+            return True
+        else:
+            pos += 1
+    return False
 
 
-def parse_allow_patterns(raw: str) -> tuple[tuple[str, re.Pattern[str]], ...]:
+def _compile_allow_pattern(source: str) -> regex.Pattern | None:
+    """``source`` compiled for the engine that bounds the match time, or None when it is ignored.
+
+    Python's ``re`` decides what is a valid pattern, so the syntax is the documented one and
+    the engine's own extensions cannot give a pattern another meaning.
+    """
+    try:
+        re.compile(source)
+        if _reads_as_fuzzy_match(source):
+            LOGGER.warning(
+                "Ignoring allow-list pattern %r: a '{' that opens no counted repeat is a fuzzy match for the regex engine, write it as '\\{'",
+                source,
+            )
+            return None
+        return regex.compile(source)
+    except (re.error, regex.error) as e:
+        LOGGER.warning("Ignoring invalid allow-list pattern %r: %s", source, e)
+        return None
+
+
+def parse_allow_patterns(raw: str) -> tuple[tuple[str, regex.Pattern], ...]:
     """Split a newline-separated regular-expression list into ``(source, compiled)`` pairs.
 
     Patterns are validated here: an invalid pattern is dropped with a warning instead of
-    failing every later analysis, and so is a pattern whose shape can hang analysis (a
-    quantified group containing a quantifier, see :func:`_has_nested_quantifier`); the
-    remaining patterns stay in force.
+    failing every later analysis; the remaining patterns stay in force. The patterns are
+    compiled for the ``regex`` engine because it bounds the time of a match
+    (see :data:`ALLOW_PATTERN_TIME_BUDGET`).
     """
     patterns = []
     for line in raw.splitlines():
         source = line.strip()
-        if not source:
-            continue
-        try:
-            compiled = re.compile(source)
-        except re.error as e:
-            LOGGER.warning("Ignoring invalid allow-list pattern %r: %s", source, e)
-            continue
-        if _has_nested_quantifier(source):
-            LOGGER.warning("Ignoring allow-list pattern %r: nested quantifiers can hang analysis on hostile text", source)
-            continue
-        patterns.append((source, compiled))
+        if source and (compiled := _compile_allow_pattern(source)) is not None:
+            patterns.append((source, compiled))
     return tuple(patterns)
 
 
@@ -194,6 +208,49 @@ def _widened_span(text: str, start: int, end: int) -> str:
     return text[start:end]
 
 
+def _warn_timed_out(source: str) -> None:
+    """Log, once per process, that ``source`` needs more time than the budget allows."""
+    if source not in _TIMED_OUT_PATTERNS:
+        _TIMED_OUT_PATTERNS.add(source)
+        LOGGER.warning(
+            "Ignoring allow-list pattern %r where it needs more than %.2f s; a quantified group in it may backtrack",
+            source,
+            ALLOW_PATTERN_TIME_BUDGET,
+        )
+
+
+def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text: str) -> set[int]:
+    """The indexes of the ``results`` that ``pattern`` keeps as-is.
+
+    Raises ``TimeoutError`` once the pattern has spent :data:`ALLOW_PATTERN_TIME_BUDGET` on
+    this call, so the caller drops every verdict of the pattern at once instead of keeping the
+    entities it had matched before running out of time.
+    """
+    deadline = time.perf_counter() + ALLOW_PATTERN_TIME_BUDGET
+
+    def seconds_left() -> float:
+        left = deadline - time.perf_counter()
+        if left <= 0:
+            raise TimeoutError
+        return left
+
+    regions = []
+    for match in pattern.finditer(text, timeout=seconds_left()):
+        regions.append(match.span())
+        seconds_left()
+    listed = set()
+    for index, result in enumerate(results):
+        span = text[result.start : result.end]
+        widened = _widened_span(text, result.start, result.end)
+        if pattern.search(span, timeout=seconds_left()) is not None:
+            listed.add(index)
+        elif pattern.search(widened, timeout=seconds_left()) is not None:
+            listed.add(index)
+        elif any(start <= result.start and result.end <= end for start, end in regions):
+            listed.add(index)
+    return listed
+
+
 def filter_results(results: list[RecognizerResult], text: str, settings: Settings) -> list[RecognizerResult]:
     """Drop results the settings suppress, keeping order.
 
@@ -205,20 +262,23 @@ def filter_results(results: list[RecognizerResult], text: str, settings: Setting
     text that contains the span; the last two tolerate recognizer boundary drift around
     an allow-listed phrase, such as a detector bounding only "Nextcloud" inside
     "Nextcloud GmbH".
+
+    Each pattern gets :data:`ALLOW_PATTERN_TIME_BUDGET` per call; one that runs out of it
+    is ignored for the whole call, so no administrator's pattern can hold the task worker.
     """
-    allow = parse_allow_patterns("\n".join(settings.allow_patterns))
-    allowed_regions = [match.span() for _, pattern in allow for match in pattern.finditer(text)]
     kept = []
     for result in results:
         if settings.score_threshold is not None and result.score < settings.score_threshold:
             continue
         if result.entity_type in settings.ignored_entity_types:
             continue
-        span = text[result.start : result.end]
-        widened = _widened_span(text, result.start, result.end)
-        if any(pattern.search(span) is not None or pattern.search(widened) is not None for _, pattern in allow):
-            continue
-        if any(start <= result.start and result.end <= end for start, end in allowed_regions):
-            continue
         kept.append(result)
-    return kept
+    if not settings.allow_patterns or not kept:
+        return kept
+    suppressed = set()
+    for source, pattern in parse_allow_patterns("\n".join(settings.allow_patterns)):
+        try:
+            suppressed |= _allow_listed(pattern, kept, text)
+        except TimeoutError:
+            _warn_timed_out(source)
+    return [result for index, result in enumerate(kept) if index not in suppressed]

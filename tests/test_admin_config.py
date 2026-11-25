@@ -119,14 +119,6 @@ def test_allow_patterns_drop_invalid_lines_with_a_warning(caplog) -> None:
     assert "([unclosed" in caplog.text
 
 
-def test_allow_patterns_refuse_nested_quantifiers_with_a_warning(caplog) -> None:
-    """The classic never-ending shapes are refused; the remaining patterns stay in force."""
-    with caplog.at_level(logging.WARNING, logger="text_anonymizer.config"):
-        patterns = parse_allow_patterns("(a+)+\n(.*)*\n(\\w+\\s?)+\nAlso Valid\n")
-    assert tuple(source for source, _ in patterns) == ("Also Valid",)
-    assert "(a+)+" in caplog.text
-
-
 @pytest.mark.parametrize(
     "pattern",
     [
