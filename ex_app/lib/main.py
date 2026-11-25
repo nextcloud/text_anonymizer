@@ -169,6 +169,8 @@ def admin_settings_form() -> SettingsForm:
                     " one of them matches its whole text, or when it sits inside a match of"
                     " one, for example public company names. A pattern that matches only part"
                     " of a longer name does not keep it: Paris keeps Paris, not Paris Hilton."
+                    " A pattern that is invalid, that can match nothing (such as (Inc\\.)? or"
+                    " .*) or that takes too long on a text is ignored; the ExApp log says which."
                     " Default: none."
                 ),
                 placeholder="Nextcloud GmbH",

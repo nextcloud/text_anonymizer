@@ -115,7 +115,11 @@ def _compile_allow_pattern(source: str) -> regex.Pattern | None:
                 source,
             )
             return None
-        return regex.compile(source)
+        compiled = regex.compile(source)
+        if compiled.fullmatch("") is not None:
+            LOGGER.warning("Ignoring allow-list pattern %r: it can match nothing, so it would stand for any text", source)
+            return None
+        return compiled
     except (re.error, regex.error) as e:
         LOGGER.warning("Ignoring invalid allow-list pattern %r: %s", source, e)
         return None
@@ -124,10 +128,11 @@ def _compile_allow_pattern(source: str) -> regex.Pattern | None:
 def parse_allow_patterns(raw: str) -> tuple[tuple[str, regex.Pattern], ...]:
     """Split a newline-separated regular-expression list into ``(source, compiled)`` pairs.
 
-    Patterns are validated here: an invalid pattern is dropped with a warning instead of
-    failing every later analysis; the remaining patterns stay in force. The patterns are
-    compiled for the ``regex`` engine because it bounds the time of a match
-    (see :data:`ALLOW_PATTERN_TIME_BUDGET`).
+    Patterns are validated here and dropped with a warning instead of failing every
+    later analysis: an invalid one, and one that can match nothing, since it would then
+    stand for any text; the remaining patterns stay in force. The patterns are compiled
+    for the ``regex`` engine because it bounds the time of a match (see
+    :data:`ALLOW_PATTERN_TIME_BUDGET`).
     """
     patterns = []
     for line in raw.splitlines():
@@ -253,7 +258,8 @@ def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text:
 
     regions = []
     for match in pattern.finditer(text, timeout=seconds_left()):
-        regions.append(match.span())
+        if match.end() > match.start():
+            regions.append(match.span())
         seconds_left()
     listed = set()
     for index, result in enumerate(results):

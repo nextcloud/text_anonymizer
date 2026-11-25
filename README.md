@@ -47,7 +47,9 @@ overrides the environment variable, and the environment variable overrides the b
   for example `URL,DATE_TIME`. Default: none.
 - `TEXT_ANONYMIZER_ALLOW_PATTERNS` — regular expressions, one per line; a detected entity is kept as-is when one of
   them matches its whole text, or when it sits inside a match of one, for example public company names. A pattern
-  that matches only part of a longer name does not keep it: `Paris` keeps Paris, not Paris Hilton. Default: none.
+  that matches only part of a longer name does not keep it: `Paris` keeps Paris, not Paris Hilton. A pattern that
+  is invalid, that can match nothing (such as `(Inc\.)?` or `.*`) or that takes too long on a text is ignored with a
+  warning in the ExApp log. Default: none.
 
 Entity types follow Presidio's names, e.g. `PERSON`, `URL` or `DATE_TIME` (see Presidio's
 [list of supported entities](https://presidio.dataprivacystack.org/supported_entities/)).

@@ -91,8 +91,8 @@ def test_a_brace_that_is_no_counted_repeat_is_refused(caplog, pattern, text):
     [
         "a{1,3}",
         "a{2,}",
-        "a{,3}",
-        "a{,}",
+        "a{,3}b",
+        "a{,}b",
         "a{}",
         r"\{2}",
         "[{]",

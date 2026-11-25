@@ -3,12 +3,16 @@
 
 """What an allow-list pattern keeps: a detection whose whole text it matches, or one inside its match in the text."""
 
+import logging
+
 import pytest
 from presidio_analyzer import RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
 
 import anonymizer
-from config import Settings, filter_results
+from config import Settings, filter_results, parse_allow_patterns
+
+LOGGER_NAME = "text_anonymizer.config"
 
 
 class FixedAnalyzer:
@@ -103,3 +107,40 @@ def test_a_detection_longer_than_the_pattern_is_not_kept():
     text = "Nextcloud GmbH & Co. KG employs Anna Meyer."
     results = [_result("ORGANIZATION", text, "Nextcloud GmbH & Co. KG")]
     assert filter_results(results, text, Settings(allow_patterns=("Nextcloud GmbH",))) == results
+
+
+@pytest.mark.parametrize("pattern", [r"(Inc\.)?", ".*", "Acme Corp|", "a*", "x?", r"(?:Acme Corp)*"])
+def test_a_pattern_that_can_match_nothing_is_refused(caplog, pattern):
+    """Such a pattern is a mistake (an optional group or a trailing bar) and used to keep every detection."""
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        assert parse_allow_patterns(pattern) == ()
+    assert repr(pattern) in caplog.text and "it can match nothing" in caplog.text
+
+
+@pytest.mark.parametrize("pattern", [r"Nextcloud( GmbH)?", "Acme Corp", r"\w+"])
+def test_a_pattern_that_needs_at_least_one_character_is_accepted(pattern):
+    assert parse_allow_patterns(pattern)[0][0] == pattern
+
+
+def test_a_pattern_with_zero_length_matches_keeps_nothing(engines):
+    """Word boundaries and lookaheads match no text, so no detection has the text of such a match."""
+    text = "Anna Meyer works in Berlin."
+    engines(("PERSON", "Anna Meyer"), ("LOCATION", "Berlin"))
+    settings = Settings(allow_patterns=(r"\b", r"(?=Anna)", r"(?<=A)"))
+    assert anonymizer.redact_text(text, settings=settings) == "<PERSON> works in <LOCATION>."
+
+
+def test_a_detection_without_text_is_never_suppressed_by_the_allow_list():
+    text = "Anna Meyer works in Berlin."
+    empty = RecognizerResult("PERSON", 5, 5, 0.85)
+    for pattern in (r"\b", r"(?=M)", r"Berlin", r"M*"):
+        assert filter_results([empty], text, Settings(allow_patterns=(pattern,))) == [empty]
+
+
+def test_an_optional_group_no_longer_leaves_the_redacted_copy_unredacted(engines):
+    r"""The reviewer's example: (Inc\.)? used to keep every entity, so the redacted copy came back as the original."""
+    text = "Anna Meyer works at Acme Corp in Berlin."
+    engines(("PERSON", "Anna Meyer"), ("ORGANIZATION", "Acme Corp"), ("LOCATION", "Berlin"))
+    assert anonymizer.redact_text(text, settings=Settings(allow_patterns=(r"(Inc\.)?",))) == (
+        "<PERSON> works at <ORGANIZATION> in <LOCATION>."
+    )
