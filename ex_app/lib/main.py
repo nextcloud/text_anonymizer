@@ -5,14 +5,18 @@
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import posixpath
+import queue
 import threading
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any
 
 from anonymizer import detect_pii, redact_text
+from batch import LOGGER as BATCH_LOGGER
 from batch import BatchReport, oversize_detail, redacted_copy_is_fresh, redact_folder, redacted_copy_path
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
@@ -37,20 +41,64 @@ from nc_py_api.files import ActionFileInfo, ActionFileInfoEx
 LOGGER = logging.getLogger(__name__)
 
 
-def configure_logging() -> None:
-    """Route application and library logs to nextcloud.log.
+# The app's log lines are sent to Nextcloud from a thread of their own, so that no thread that logs waits
+# for the request: neither the event loop, which must stay free for AppAPI's heartbeat, nor a folder run
+# between two files.
+LOG_QUEUE_SIZE = 200
+# How long the shutdown waits for lines that are not sent yet.
+LOG_FLUSH_SECONDS = 2.0
 
-    The handler is attached to the root logger, so module loggers such as the batch progress
-    logger propagate into it; the root level is lowered to INFO for the same reason, as it
-    defaults to WARNING and would drop the per-file progress lines.
+
+class _LogQueueHandler(logging.handlers.QueueHandler):
+    """Puts the lines of the app's loggers on the queue of the sending thread."""
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        # The queue fills only while Nextcloud does not answer, when nothing could be delivered anyway.
+        with suppress(queue.Full):
+            self.queue.put_nowait(record)
+
+
+def configure_logging() -> logging.handlers.QueueListener:
+    """Send what the app's own loggers log at INFO and above to nextcloud.log.
+
+    Only the app's loggers feed the queue. Libraries log one INFO line per request or per redaction, and
+    each line sent would be one more request to Nextcloud, which drops INFO at its default loglevel anyway.
     """
-    setup_nextcloud_logging()
-    logging.getLogger().setLevel(logging.INFO)
+    log_queue: queue.Queue[logging.LogRecord] = queue.Queue(LOG_QUEUE_SIZE)
+    for logger in (LOGGER, BATCH_LOGGER):
+        logger.setLevel(logging.INFO)
+        logger.addHandler(_LogQueueHandler(log_queue))
+    nextcloud_handler = setup_nextcloud_logging()
+    logging.getLogger().removeHandler(nextcloud_handler)  # nc_py_api attaches it to the root logger
+    sender = logging.handlers.QueueListener(log_queue, nextcloud_handler)
+    sender.start()
+    return sender
+
+
+def _stop_sender(sender: logging.handlers.QueueListener) -> None:
+    # A full queue refuses the stop sign of the listener until the listener has sent a line.
+    while True:
+        try:
+            sender.stop()
+        except queue.Full:
+            time.sleep(0.05)
+        else:
+            return
+
+
+def flush_logs(sender: logging.handlers.QueueListener) -> None:
+    """Send what is queued before the app ends, but wait at most ``LOG_FLUSH_SECONDS``.
+
+    A sender that waits for the answer of a request it has already made is left to end with the process.
+    """
+    stopper = threading.Thread(target=_stop_sender, args=(sender,), daemon=True)
+    stopper.start()
+    stopper.join(LOG_FLUSH_SECONDS)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    configure_logging()
+    log_sender = configure_logging()
     set_handlers(app, enabled_handler, trigger_handler=trigger_handler)
     if NextcloudApp().enabled_state:
         APP_ENABLED.set()
@@ -59,6 +107,7 @@ async def lifespan(app: FastAPI):
     SHUTDOWN.set()
     TRIGGER.set()
     await worker
+    flush_logs(log_sender)
 
 
 APP = FastAPI(lifespan=lifespan)

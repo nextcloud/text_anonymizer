@@ -3,15 +3,21 @@
 
 """Tests for folder-level batch redaction and its guards."""
 
+import asyncio
+import contextlib
 import datetime
 import logging
+import logging.handlers
 import posixpath
 import re
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from nc_py_api import NextcloudException
+from nc_py_api.ex_app import LogLvl
 from nc_py_api.files import ActionFileInfo, FsNode
 
 import batch
@@ -825,21 +831,172 @@ def test_single_file_action_is_a_no_op_when_the_copy_is_fresh(monkeypatch):
     assert nc.notifications.created[-1] == ("A redacted copy of notes.txt is already up to date", "")
 
 
-def test_configure_logging_lets_batch_progress_reach_the_root_handlers(caplog):
-    """Batch progress logs at INFO and must reach the handlers attached to the root logger,
-    which the ExApp logging setup lowers from the WARNING default."""
+@contextlib.contextmanager
+def logging_to(posted: list, stall: float = 0.0, gate: threading.Event | None = None):
+    """Run ``configure_logging`` with what it would post to Nextcloud collected in ``posted`` instead.
+
+    Each post is ``(thread id, level, message)`` and takes ``stall`` seconds. With a ``gate`` that is not set,
+    every post waits for it, as it does for a Nextcloud that hangs. The loggers are restored and the sender
+    stopped at the end.
+    """
+
+    class Nextcloud:
+        def log(self, level, message, fast_send=False):
+            posted.append((threading.get_ident(), level, message))
+            time.sleep(stall)
+            if gate is not None:
+                gate.wait(timeout=30)
+
+    loggers = (main.LOGGER, batch.LOGGER)
+    saved = [(logger, logger.handlers[:], logger.level) for logger in loggers]
     root = logging.getLogger()
-    handlers_before = list(root.handlers)
-    level_before = root.level
-    try:
-        main.configure_logging()
-        assert root.level <= logging.INFO
-        assert len(root.handlers) > len(handlers_before)
-        root.handlers[:] = handlers_before
-        root.setLevel(logging.INFO)
+    root_handlers, root_level = root.handlers[:], root.level
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("nc_py_api.ex_app.logger.NextcloudApp", lambda: Nextcloud())
+        listener = main.configure_logging()
+        try:
+            yield
+        finally:
+            main.flush_logs(listener)
+            for logger, handlers, level in saved:
+                logger.handlers[:] = handlers
+                logger.setLevel(level)
+            root.handlers[:] = root_handlers
+            root.setLevel(root_level)
+
+
+def test_only_the_app_loggers_reach_nextcloud():
+    """A library logs one line per request or per redaction; each line sent would be one more request."""
+    posted = []
+    with logging_to(posted):
+        logging.getLogger("httpx").info('HTTP Request: GET https://nextcloud/ocs/v2.php/tasks_provider/next "HTTP/1.1 204"')
+        logging.getLogger("presidio_analyzer.analyzer_engine").warning("Recognizer not added to registry")
+        logging.getLogger("niquests").error("Connection failed")
+        batch.LOGGER.info("Redacting alpha.txt (1 of 4)")
+        main.LOGGER.warning("Not redacting docs/: no file can be created in this folder")
+    assert [(level, message) for _thread, level, message in posted] == [
+        (LogLvl.INFO, "Redacting alpha.txt (1 of 4)"),
+        (LogLvl.WARNING, "Not redacting docs/: no file can be created in this folder"),
+    ]
+    # The root logger is left alone: it neither carries a handler to Nextcloud nor passes INFO.
+    root = logging.getLogger()
+    assert not any(isinstance(handler, logging.handlers.QueueHandler) for handler in root.handlers)
+    assert root.level == logging.WARNING
+
+
+def test_a_library_logger_lowered_to_info_does_not_reach_nextcloud():
+    posted = []
+    with logging_to(posted):
+        logging.getLogger("httpx").setLevel(logging.INFO)
+        logging.getLogger("httpx").info("HTTP Request: GET https://nextcloud/")
+    logging.getLogger("httpx").setLevel(logging.NOTSET)
+    assert posted == []
+
+
+def test_the_app_logs_at_info_and_caplog_still_sees_it(caplog):
+    """The batch progress lines are INFO and must pass, and tests keep reading them through the root handlers."""
+    with logging_to([]):
         with caplog.at_level(logging.INFO):
-            logging.getLogger("batch").info("Redacting alpha.txt (1 of 4)")
-        assert "Redacting alpha.txt" in caplog.text
-    finally:
-        root.handlers[:] = handlers_before
-        root.setLevel(level_before)
+            batch.LOGGER.info("Redacting alpha.txt (1 of 4)")
+    assert "Redacting alpha.txt (1 of 4)" in caplog.text
+
+
+def test_no_line_is_posted_from_the_event_loops_thread():
+    """The poller logs its errors on the event loop; the loop must not wait for the request that follows."""
+    posted = []
+    loop_thread = []
+
+    async def scenario():
+        loop_thread.append(threading.get_ident())
+        loop = asyncio.get_running_loop()
+        gaps = []
+
+        async def ticker():
+            last = loop.time()
+            for _ in range(30):
+                await asyncio.sleep(0.01)
+                now = loop.time()
+                gaps.append(now - last)
+                last = now
+
+        ticks = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)
+        main.LOGGER.error("Failed to fetch or process the next task")
+        await ticks
+        return max(gaps)
+
+    # Each post takes 0.3 seconds, as it does for a Nextcloud that is slow to answer.
+    with logging_to(posted, stall=0.3):
+        worst_gap = asyncio.run(scenario())
+    assert posted and posted[0][0] != loop_thread[0]
+    assert worst_gap < 0.25
+
+
+def test_the_traceback_of_a_failure_reaches_nextcloud():
+    """The lines sent while the app runs name the file that failed and carry the traceback of the failure."""
+    posted = []
+    with logging_to(posted):
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            batch.LOGGER.exception("Failed to redact docs/a.txt")
+    [(level, message)] = [(level, message) for _thread, level, message in posted]
+    assert level == LogLvl.ERROR
+    assert message.startswith("Failed to redact docs/a.txt\nTraceback (most recent call last):")
+    assert message.rstrip().endswith("ValueError: boom")
+
+
+def test_a_full_queue_drops_new_lines_without_an_error(capsys):
+    """The queue fills only while Nextcloud does not answer; a line more must not raise or block."""
+    posted = []
+    gate = threading.Event()
+    with logging_to(posted, gate=gate):
+        for number in range(main.LOG_QUEUE_SIZE + 10):
+            batch.LOGGER.info("Redacting f%d.txt", number)
+        gate.set()
+    assert main.LOG_QUEUE_SIZE <= len(posted) <= main.LOG_QUEUE_SIZE + 1
+    assert "Logging error" not in capsys.readouterr().err
+
+
+def test_the_shutdown_does_not_wait_for_a_hanging_request():
+    """A post that never gets an answer must not hold up the shutdown of the app."""
+    posted = []
+    gate = threading.Event()
+    clock = time.monotonic()
+    with logging_to(posted, gate=gate):
+        batch.LOGGER.info("Redacting a.txt (1 of 1)")
+        # The sending thread has taken the line and now waits for its answer.
+        deadline = time.monotonic() + 5
+        while not posted and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert posted
+    elapsed = time.monotonic() - clock
+    gate.set()
+    assert main.LOG_FLUSH_SECONDS <= elapsed < main.LOG_FLUSH_SECONDS + 2
+
+
+def test_lifespan_flushes_the_logs_after_the_worker_ended(monkeypatch):
+    """Lines of the worker's last moments are sent too: the sender stops only after the worker."""
+    events = []
+    listener = object()
+    monkeypatch.setattr(main, "configure_logging", lambda: events.append("configured") or listener)
+    monkeypatch.setattr(main, "flush_logs", lambda sender: events.append("flushed" if sender is listener else "other"))
+    monkeypatch.setattr(main, "set_handlers", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "NextcloudApp", lambda: SimpleNamespace(enabled_state=True))
+    monkeypatch.setattr(main, "SHUTDOWN", threading.Event())
+
+    async def worker():
+        events.append("worker started")
+        while not main.SHUTDOWN.is_set():
+            await asyncio.sleep(0.01)
+        events.append("worker ended")
+
+    monkeypatch.setattr(main, "process_tasks", worker)
+
+    async def run():
+        async with main.lifespan(main.APP):
+            events.append("app up")
+
+    asyncio.run(run())
+    # The worker task starts when the event loop next runs, i.e. after the app is up.
+    assert events == ["configured", "app up", "worker started", "worker ended", "flushed"]
