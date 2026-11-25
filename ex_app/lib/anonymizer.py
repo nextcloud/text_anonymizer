@@ -8,6 +8,7 @@ fallback engine when GLiNER is disabled or fails to load. English and German are
 German adds its own spaCy model and the DE_* recognizer pack.
 """
 
+import copy
 import logging
 import os
 import threading
@@ -119,6 +120,29 @@ def _supported_languages() -> list[str]:
     return languages
 
 
+def _build_gliner_recognizers(languages: list[str]) -> list[GLiNERRecognizer]:
+    """One GLiNER recognizer per language. The first loads the model, the others share it.
+
+    The constructor of every recognizer loads the model itself (``EntityRecognizer.__init__`` calls
+    ``load()``), so the other languages are shallow copies of the first recognizer: apart from the
+    language all of their attributes are equal, and they share the loaded model.
+    """
+    first = GLiNERRecognizer(
+        supported_language=languages[0],
+        model_name=GLINER_MODEL,
+        entity_mapping=GLINER_ENTITY_MAPPING,
+        flat_ner=False,
+        multi_label=True,
+        map_location="cpu",
+    )
+    recognizers = [first]
+    for language in languages[1:]:
+        recognizer = copy.copy(first)
+        recognizer.supported_language = language
+        recognizers.append(recognizer)
+    return recognizers
+
+
 def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
     """Add a GLiNER recognizer per language and drop the spaCy NER recognizers.
 
@@ -126,25 +150,8 @@ def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
     package missing, model download unavailable), the spaCy recognizers are kept as the
     fallback engine.
     """
-    recognizers = []
     try:
-        for language in languages:
-            recognizer = GLiNERRecognizer(
-                supported_language=language,
-                model_name=GLINER_MODEL,
-                entity_mapping=GLINER_ENTITY_MAPPING,
-                flat_ner=False,
-                multi_label=True,
-                map_location="cpu",
-            )
-            if recognizers:
-                # One model copy is shared between the language instances instead of loading it
-                # once per language.
-                recognizer.gliner = recognizers[0].gliner
-                recognizer.is_loaded = True
-            else:
-                recognizer.load()
-            recognizers.append(recognizer)
+        recognizers = _build_gliner_recognizers(languages)
     except Exception:
         LOGGER.warning(
             "The GLiNER model %s could not be loaded, using the spaCy detection engine",

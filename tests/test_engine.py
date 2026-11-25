@@ -148,6 +148,35 @@ def test_gliner_engine_loads_and_detects_english_pii(monkeypatch):
     assert "John Smith" not in redacted
 
 
+def test_gliner_model_is_loaded_once_for_all_languages(monkeypatch):
+    """The model is loaded once: every further language is a copy of the first recognizer.
+
+    EntityRecognizer's constructor loads the model of each instance, so this runs the real
+    GLiNERRecognizer and only replaces the GLiNER class its load() calls.
+    """
+    from presidio_analyzer.predefined_recognizers.ner import gliner_recognizer
+
+    loaded = []
+
+    class CountingGLiNER:
+        @staticmethod
+        def from_pretrained(model_name, **kwargs):
+            model = object()
+            loaded.append(model)
+            return model
+
+    monkeypatch.setattr(gliner_recognizer, "GLiNER", CountingGLiNER)
+    analyzer, _ = build_engines(monkeypatch, german_model=True)
+
+    assert len(loaded) == 1
+    gliner_recognizers = [r for r in analyzer.registry.recognizers if r.name == "GLiNERRecognizer"]
+    assert {r.supported_language for r in gliner_recognizers} == {"en", "de"}
+    # The copy is a working recognizer of its own language that shares the loaded model.
+    assert all(r.is_loaded for r in gliner_recognizers)
+    assert all(r.gliner is loaded[0] for r in gliner_recognizers)
+    assert [r.supported_language for r in analyzer.registry.get_recognizers("de", all_fields=True) if r.name == "GLiNERRecognizer"] == ["de"]
+
+
 def test_gliner_load_failure_falls_back_to_spacy(monkeypatch, caplog):
     """A GLiNER load failure keeps the spaCy NER recognizer and logs a warning."""
     fake_gliner = make_fake_gliner({}, load_error=ImportError("the gliner package is not installed"))
