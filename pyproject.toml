@@ -33,6 +33,9 @@ target-version = "py311"
 select = ["A", "B", "C", "D", "E", "F", "G", "I", "S", "SIM", "PIE", "Q", "RET", "RUF", "UP" , "W"]
 extend-ignore = ["D101", "D102", "D103", "D105", "D107", "D203", "D213", "D401", "I001", "RUF100", "D400", "D415"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D100", "S101"]
+
 [tool.isort]
 profile = "black"
 
@@ -63,5 +66,13 @@ messages_control.disable = [
 
 [dependency-groups]
 dev = [
-    "pylint (>=4.1.4,<5.0.0)"
+    "pylint (>=4.1.4,<5.0.0)",
+    "pytest (>=9.2.0,<10.0.0)"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["ex_app/lib"]
+markers = [
+    "spacy: needs the en_core_web_lg spaCy model, skipped if it is not installed",
 ]

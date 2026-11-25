@@ -31,13 +31,13 @@ make register
 
 ## Testing
 
-(to be decided later)
+Use pytest to run our test suite.
 
 ## Contributing
 
 ### What CI checks
 
-The CI runs our Python linter as well as a REUSE compliance check, both of which should pass before merging.
+The CI runs Pytest, our Python linter, as well as a REUSE compliance check, all of which should pass before merging.
 
 ### How changes flow
 
