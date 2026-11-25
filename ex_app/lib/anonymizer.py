@@ -36,6 +36,7 @@ from presidio_analyzer.predefined_recognizers import (
     DeTaxNumberRecognizer,
     DeVatIdRecognizer,
     GLiNERRecognizer,
+    SpacyRecognizer,
 )
 from presidio_analyzer.recognizer_registry import RecognizerRegistry
 from presidio_anonymizer import AnonymizerEngine
@@ -56,6 +57,7 @@ ENGINE_SPACY = "spacy"
 # Zero-shot PII model, Apache-2.0, multilingual, runs on CPU. Its entity labels are mapped to
 # Presidio types; labels without a Presidio equivalent (e.g. "passport number") are omitted
 # because the country-specific regex recognizers with checksums cover those IDs more precisely.
+# The labels of NRP and DATE_TIME stand for two types that the spaCy NER delivers as well.
 GLINER_MODEL = "urchade/gliner_multi_pii-v1"
 GLINER_ENTITY_MAPPING = {
     "person": "PERSON",
@@ -64,6 +66,11 @@ GLINER_ENTITY_MAPPING = {
     "location": "LOCATION",
     "address": "LOCATION",
     "date of birth": "DATE_TIME",
+    "date": "DATE_TIME",
+    "time": "DATE_TIME",
+    "nationality": "NRP",
+    "religion": "NRP",
+    "political group": "NRP",
     "phone number": "PHONE_NUMBER",
     "mobile phone number": "PHONE_NUMBER",
     "landline phone number": "PHONE_NUMBER",
@@ -99,6 +106,8 @@ GERMAN_RECOGNIZERS = (
     DeTaxNumberRecognizer,
     DeVatIdRecognizer,
 )
+# The types the spaCy NER keeps delivering next to the GLiNER model.
+GLINER_SPACY_ENTITIES = ("NRP", "DATE_TIME")
 # Presidio's default configuration registers the credit card recognizer for en, es, it and pl.
 GERMAN_CARD_CONTEXT = [
     "kreditkarte",
@@ -215,12 +224,25 @@ def _build_gliner_recognizers(languages: list[str]) -> list[GLiNERRecognizer]:
     return recognizers
 
 
-def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
-    """Add a GLiNER recognizer per language and drop the spaCy NER recognizers.
+def _use_gliner(analyzer: AnalyzerEngine, recognizers: list[GLiNERRecognizer]) -> None:
+    """Register the GLiNER recognizers and reduce the spaCy NER recognizers to NRP and DATE_TIME.
 
-    All language instances share one loaded model. If loading fails for any reason (gliner
-    package missing, model download unavailable), the spaCy recognizers are kept as the
-    fallback engine and the load is tried again later.
+    The spaCy pipeline runs for every engine, so its spans of these two types come at no cost as a
+    second source next to the labels of the model.
+    """
+    registry = analyzer.registry
+    registry.remove_recognizer("SpacyRecognizer")
+    for language in analyzer.supported_languages:
+        registry.add_recognizer(SpacyRecognizer(supported_language=language, supported_entities=list(GLINER_SPACY_ENTITIES)))
+    for recognizer in recognizers:
+        registry.add_recognizer(recognizer)
+
+
+def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
+    """Switch the analyzer to the GLiNER engine: one recognizer per language, sharing one loaded model.
+
+    If loading fails for any reason (gliner package missing, model download unavailable), the
+    spaCy recognizers are kept as the fallback engine and the load is tried again later.
     """
     try:
         recognizers = _build_gliner_recognizers(languages)
@@ -233,9 +255,7 @@ def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
         _schedule_gliner_retry(error)
         return False
 
-    for recognizer in recognizers:
-        analyzer.registry.add_recognizer(recognizer)
-    analyzer.registry.remove_recognizer("SpacyRecognizer")
+    _use_gliner(analyzer, recognizers)
     return True
 
 
@@ -310,10 +330,11 @@ def _retry_gliner(fallback: tuple[AnalyzerEngine, AnonymizerEngine]) -> None:
         # A new analyzer over the loaded spaCy models: a request that already holds the fallback
         # analyzer finishes with it, and no recognizer is removed from an analyzer in use.
         registry = RecognizerRegistry(
-            recognizers=[r for r in fallback_analyzer.registry.recognizers if r.name != "SpacyRecognizer"] + recognizers,
+            recognizers=[r for r in fallback_analyzer.registry.recognizers if r.name != "SpacyRecognizer"],
             supported_languages=languages,
         )
         analyzer = AnalyzerEngine(nlp_engine=fallback_analyzer.nlp_engine, registry=registry, supported_languages=languages)
+        _use_gliner(analyzer, recognizers)
     except Exception as error:
         LOGGER.warning(
             "The GLiNER model %s could not be loaded, using the spaCy detection engine",

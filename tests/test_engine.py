@@ -140,6 +140,11 @@ def isolated_engines(monkeypatch):
     reset_engine_state()
 
 
+def spacy_entities(analyzer, language):
+    """The entity types the spaCy NER recognizer of a language delivers."""
+    return {entity for r in analyzer.registry.get_recognizers(language, all_fields=True) if r.name == "SpacyRecognizer" for entity in r.supported_entities}
+
+
 def recognizer_names(analyzer, language=None):
     recognizers = (
         analyzer.registry.recognizers
@@ -155,7 +160,7 @@ def test_gliner_engine_loads_and_detects_english_pii(monkeypatch):
     analyzer, _ = build_engines(monkeypatch, gliner=fake_gliner)
 
     assert recognizer_names(analyzer).count("GLiNERRecognizer") == 1
-    assert "SpacyRecognizer" not in recognizer_names(analyzer)
+    assert spacy_entities(analyzer, "en") == {"NRP", "DATE_TIME"}
     assert "PERSON: John Smith" in anonymizer.detect_pii(ENGLISH_TEXT)
     redacted = anonymizer.redact_text(ENGLISH_TEXT)
     assert "<PERSON>" in redacted
@@ -294,7 +299,7 @@ def test_failed_gliner_load_is_retried_without_blocking_requests(monkeypatch):
     analyzer, _ = anonymizer._get_engines()
     assert attempts == [anonymizer.GLINER_MODEL, anonymizer.GLINER_MODEL]
     assert "GLiNERRecognizer" in recognizer_names(analyzer)
-    assert "SpacyRecognizer" not in recognizer_names(analyzer)
+    assert spacy_entities(analyzer, "en") == {"NRP", "DATE_TIME"}
     # The loaded spaCy models are kept, and German keeps its recognizers.
     assert analyzer.nlp_engine is fallback_analyzer.nlp_engine
     assert "DeTaxIdRecognizer" in recognizer_names(analyzer, language="de")
@@ -371,6 +376,70 @@ def test_gliner_model_is_loaded_from_the_persistent_storage(monkeypatch, storage
     build_engines(monkeypatch, german_model=True)
 
     assert [load["cache_dir"] for load in loads] == [expected]
+
+
+NRP_DATE_TEXT = "Maria Weber is a British citizen of Muslim faith who supports the Labour Party and will visit us next Tuesday."
+
+
+def fake_gliner_model(monkeypatch, canned):
+    """Stand in for the loaded GLiNER model: it returns a span for every label it is asked for."""
+    from presidio_analyzer.predefined_recognizers.ner import gliner_recognizer
+
+    class FakeModel:
+        asked = []
+
+        def predict_entities(self, text, labels, **kwargs):
+            FakeModel.asked.append(list(labels))
+            return [
+                {"start": text.index(value), "end": text.index(value) + len(value), "text": value, "label": label, "score": 0.9}
+                for label, value in canned
+                if label in labels and value in text
+            ]
+
+    monkeypatch.setattr(gliner_recognizer, "GLiNER", type("GLiNER", (), {"from_pretrained": staticmethod(lambda *a, **kw: FakeModel())}))
+    return FakeModel
+
+
+def test_gliner_is_asked_for_nrp_and_date_labels(monkeypatch):
+    """The model is asked for the labels behind NRP and DATE_TIME, in every language.
+
+    Before the GLiNER engine, English texts got both from the spaCy NER.
+    """
+    model = fake_gliner_model(
+        monkeypatch, [("nationality", "British"), ("religion", "Muslim faith"), ("date", "next Tuesday"), ("date", "nächsten Dienstag")]
+    )
+    build_engines(monkeypatch, german_model=True)
+
+    detected = anonymizer.detect_pii(NRP_DATE_TEXT)
+    assert "NRP: British" in detected
+    assert "NRP: Muslim faith" in detected
+    assert "DATE_TIME: next Tuesday" in detected
+    assert "DATE_TIME: nächsten Dienstag" in anonymizer.detect_pii("Anna kommt nächsten Dienstag.", language="de")
+    asked_en, asked_de = model.asked
+    for asked in (asked_en, asked_de):
+        assert {"nationality", "religion", "political group", "date", "time"} <= set(asked)
+        # The Presidio names of the two types are never sent as raw labels.
+        assert not {"NRP", "DATE_TIME"} & set(asked)
+
+
+def test_gliner_engine_keeps_spacy_ner_for_nrp_and_date_time_only(monkeypatch):
+    """Next to the model, the spaCy NER delivers only the two types of the labels, for every language."""
+    fake_gliner = make_fake_gliner({"en": [], "de": []})
+    analyzer, _ = build_engines(monkeypatch, german_model=True, gliner=fake_gliner)
+
+    assert spacy_entities(analyzer, "en") == {"NRP", "DATE_TIME"}
+    assert spacy_entities(analyzer, "de") == {"NRP", "DATE_TIME"}
+
+
+@pytest.mark.skipif(not ENGLISH_MODEL_INSTALLED, reason="the English spaCy model is not installed")
+def test_spacy_ner_delivers_nrp_and_date_time_with_the_gliner_engine(monkeypatch):
+    """With the real spaCy model, the two types come from the spaCy NER even if the model finds nothing."""
+    fake_gliner = make_fake_gliner({"en": []})
+    build_engines(monkeypatch, gliner=fake_gliner)
+
+    detected = anonymizer.detect_pii(NRP_DATE_TEXT)
+    assert "NRP: British" in detected
+    assert "DATE_TIME: next Tuesday" in detected
 
 
 def test_engine_env_var_selects_spacy(monkeypatch):
