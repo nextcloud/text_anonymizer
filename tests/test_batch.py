@@ -430,6 +430,38 @@ def test_collect_text_files_indexes_the_redacted_copies_by_original():
 
 
 @pytest.mark.parametrize(
+    ("user_path", "expected"),
+    [
+        ("docs/notes.txt", "docs/notes (redacted).txt"),
+        ("docs/notes", "docs/notes (redacted)"),
+        ("docs/archive.tar.gz", "docs/archive.tar (redacted).gz"),
+        ("docs/notes (redacted).txt", "docs/notes (redacted).txt"),
+        ("docs/notes (redacted 2).txt", "docs/notes (redacted).txt"),
+    ],
+)
+def test_canonical_redacted_copy_path_names_the_first_candidate(user_path, expected):
+    assert batch.canonical_redacted_copy_path(user_path) == expected
+
+
+@pytest.mark.parametrize(
+    ("existing", "expected"),
+    [
+        ([], "docs/notes (redacted).txt"),
+        (["docs/notes (redacted).txt"], "docs/notes (redacted 2).txt"),
+        (["docs/notes (redacted).txt", "docs/notes (redacted 2).txt"], "docs/notes (redacted 3).txt"),
+        (["docs/notes (redacted 2).txt"], "docs/notes (redacted).txt"),
+        (["docs/notes (redacted).txt", "docs/notes (redacted 3).txt"], "docs/notes (redacted 2).txt"),
+    ],
+)
+def test_redacted_copy_path_takes_the_first_free_number(existing, expected):
+    """The copies of an original that was redacted again are numbered from the first free candidate."""
+    nc = FakeNc()
+    for path in existing:
+        nc.files.add_file(path, b"copy", "text/plain")
+    assert batch.redacted_copy_path(nc, "docs/notes.txt") == expected
+
+
+@pytest.mark.parametrize(
     "mimetype",
     ["text/plain", "text/csv", "text/markdown", "TEXT/PLAIN", "application/json", "application/xml",
      "application/yaml", "application/toml", "application/rss+xml", "application/geo+json"],

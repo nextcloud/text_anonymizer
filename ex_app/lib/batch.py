@@ -97,26 +97,29 @@ def path_exists(nc: NextcloudApp, user_path: str) -> bool:
     return True
 
 
-def canonical_redacted_copy_path(user_path: str) -> str:
-    """The first candidate path for the redacted copy of ``user_path``, e.g. ``notes (redacted).txt``."""
+def _redacted_copy_path(user_path: str, suffix: str) -> str:
+    """The path of a redacted copy of ``user_path`` whose name carries ``suffix``, e.g. `` (redacted 2)``."""
     directory, name = posixpath.split(user_path)
     stem, ext = posixpath.splitext(name)
     stem = REDACTED_SUFFIX_RE.sub("", stem)
-    return posixpath.join(directory, f"{stem} (redacted){ext}")
+    return posixpath.join(directory, f"{stem}{suffix}{ext}")
+
+
+def canonical_redacted_copy_path(user_path: str) -> str:
+    """The first candidate path for the redacted copy of ``user_path``, e.g. ``notes (redacted).txt``."""
+    return _redacted_copy_path(user_path, " (redacted)")
 
 
 def redacted_copy_path(nc: NextcloudApp, user_path: str) -> str:
     """Return a free path next to ``user_path`` for the redacted copy, e.g. ``notes (redacted).txt``.
 
-    Redacting an existing copy such as ``notes (redacted).txt`` yields ``notes (redacted 2).txt``.
+    A taken candidate is numbered: an original that is redacted again while ``notes (redacted).txt``
+    exists gets ``notes (redacted 2).txt``.
     """
-    directory, name = posixpath.split(user_path)
-    stem, ext = posixpath.splitext(name)
-    stem = REDACTED_SUFFIX_RE.sub("", stem)
     candidate = canonical_redacted_copy_path(user_path)
     counter = 2
     while path_exists(nc, candidate):
-        candidate = posixpath.join(directory, f"{stem} (redacted {counter}){ext}")
+        candidate = _redacted_copy_path(user_path, f" (redacted {counter})")
         counter += 1
     return candidate
 
