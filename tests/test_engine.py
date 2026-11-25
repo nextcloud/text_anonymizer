@@ -189,6 +189,39 @@ def test_gliner_load_failure_falls_back_to_spacy(monkeypatch, caplog):
     assert "spaCy detection engine" in caplog.text
 
 
+# A number that passes the Luhn checksum, as the checksums on real cards do.
+VALID_CARD = "4111 1111 1111 1111"
+GERMAN_CARD_TEXT = f"Kartennummer: {VALID_CARD}."
+
+
+def test_german_card_number_is_detected(monkeypatch):
+    """German has its own credit card recognizer, with German context words.
+
+    Presidio's default configuration registers CreditCardRecognizer for en, es, it and pl only.
+    """
+    monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, anonymizer.ENGINE_SPACY)
+    analyzer, _ = build_engines(monkeypatch, german_model=True)
+
+    card = next(
+        r for r in analyzer.registry.get_recognizers("de", all_fields=True) if r.name == "CreditCardRecognizer"
+    )
+    assert card.supported_language == "de"
+    assert "kreditkarte" in card.context
+    assert f"CREDIT_CARD: {VALID_CARD}" in anonymizer.detect_pii(GERMAN_CARD_TEXT, language="de")
+    redacted = anonymizer.redact_text(GERMAN_CARD_TEXT, language="de")
+    assert VALID_CARD not in redacted
+    assert "<CREDIT_CARD>" in redacted
+
+
+def test_german_card_number_failing_the_checksum_is_not_detected(monkeypatch):
+    """The German recognizer keeps the checksum: a number that fails it is not a card."""
+    monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, anonymizer.ENGINE_SPACY)
+    build_engines(monkeypatch, german_model=True)
+
+    detected = anonymizer.detect_pii(GERMAN_CARD_TEXT.replace("1111.", "1112."), language="de")
+    assert "CREDIT_CARD" not in detected
+
+
 def test_gliner_model_download_failure_falls_back_to_spacy(monkeypatch):
     """A model download failure (e.g. no network) is also caught and falls back to spaCy."""
     fake_gliner = make_fake_gliner({}, load_error=OSError("model download failed"))

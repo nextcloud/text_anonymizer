@@ -17,6 +17,7 @@ from collections.abc import Callable
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import (
+    CreditCardRecognizer,
     DeBsnrRecognizer,
     DeFuehrerscheinRecognizer,
     DeHandelsregisterRecognizer,
@@ -90,6 +91,18 @@ GERMAN_RECOGNIZERS = (
     DeTaxNumberRecognizer,
     DeVatIdRecognizer,
 )
+# Presidio's default configuration registers the credit card recognizer for en, es, it and pl.
+GERMAN_CARD_CONTEXT = [
+    "kreditkarte",
+    "kreditkartennummer",
+    "kartennummer",
+    "ec-karte",
+    "girocard",
+    "maestro",
+    "visa",
+    "mastercard",
+    "amex",
+]
 
 _LOCK = threading.Lock()
 _ENGINES: tuple[AnalyzerEngine, AnonymizerEngine] | None = None
@@ -179,6 +192,7 @@ def _build_engines() -> tuple[AnalyzerEngine, AnonymizerEngine]:
     if "de" in languages:
         for recognizer in GERMAN_RECOGNIZERS:
             analyzer.registry.add_recognizer(recognizer(supported_language="de"))
+        analyzer.registry.add_recognizer(CreditCardRecognizer(supported_language="de", context=GERMAN_CARD_CONTEXT))
     if _requested_engine() == ENGINE_GLINER:
         engine = ENGINE_GLINER if _enable_gliner(analyzer, languages) else ENGINE_SPACY
     else:
