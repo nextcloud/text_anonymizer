@@ -58,7 +58,7 @@ def test_a_sound_pattern_is_unaffected_by_the_budget():
     config._TIMED_OUT_PATTERNS.clear()
     text = "Nextcloud GmbH employs Anna Meyer in Berlin."
     results = [_result(0, 14, 0.9), _result(23, 33), _result(37, 43)]
-    kept = filter_results(results, text, Settings(allow_patterns=("Berlin", "Nextcloud")))
+    kept = filter_results(results, text, Settings(allow_patterns=("Berlin", "Nextcloud GmbH")))
     assert kept == [results[1]]
     assert config._TIMED_OUT_PATTERNS == set()
 

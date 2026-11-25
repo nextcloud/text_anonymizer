@@ -195,6 +195,23 @@ def apply_admin_config(base: Settings, values: Mapping[str, str]) -> Settings:
     return replace(base, **overrides) if overrides else base
 
 
+#: A possessive at the end of a detection, "Anna Meyer's", which a recognizer counts as part of the name.
+_POSSESSIVE = re.compile(r"['\u2019]s$", re.IGNORECASE)
+
+
+def _name_bounds(text: str, start: int, end: int) -> tuple[int, int]:
+    """The part of a detection that is the name itself: without the spaces around it and without a
+    possessive at its end."""
+    start, end = max(0, start), min(len(text), end)
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    if end - start > 2 and _POSSESSIVE.search(text, start, end):
+        end -= 2
+    return start, end
+
+
 def _widened_span(text: str, start: int, end: int) -> str:
     """The span extended to the surrounding word boundaries (apostrophes and hyphens count
     as word-internal), so a detection cutting a word in half still hits allow-list patterns
@@ -240,13 +257,16 @@ def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text:
         seconds_left()
     listed = set()
     for index, result in enumerate(results):
-        span = text[result.start : result.end]
-        widened = _widened_span(text, result.start, result.end)
-        if pattern.search(span, timeout=seconds_left()) is not None:
+        start, end = _name_bounds(text, result.start, result.end)
+        if end <= start:
+            continue
+        span = text[start:end]
+        widened = _widened_span(text, start, end)
+        if pattern.fullmatch(span, timeout=seconds_left()) is not None:
             listed.add(index)
-        elif pattern.search(widened, timeout=seconds_left()) is not None:
+        elif pattern.fullmatch(widened, timeout=seconds_left()) is not None:
             listed.add(index)
-        elif any(start <= result.start and result.end <= end for start, end in regions):
+        elif any(region_start <= start and end <= region_end for region_start, region_end in regions):
             listed.add(index)
     return listed
 
@@ -257,11 +277,13 @@ def filter_results(results: list[RecognizerResult], text: str, settings: Setting
     A result is dropped when its entity type is ignored, or when its matched text is
     allow-listed (e.g. a public company name that must never be redacted); a score
     threshold drops low-scoring results only when the threshold itself is set (see
-    :class:`Settings`). An allow-list pattern suppresses a result when it matches the
-    span text, the span text widened to word boundaries, or a region of the analyzed
-    text that contains the span; the last two tolerate recognizer boundary drift around
-    an allow-listed phrase, such as a detector bounding only "Nextcloud" inside
-    "Nextcloud GmbH".
+    :class:`Settings`). An allow-list pattern suppresses a result when the pattern
+    matches the whole span text, the whole span text widened to word boundaries, or
+    when the span lies inside a match of the pattern in the analyzed text; the last
+    two tolerate recognizer boundary drift around an allow-listed phrase, such as a
+    detector bounding only "Nextcloud" inside "Nextcloud GmbH", and a possessive or a space
+    a detector adds to a name is not part of it. A pattern that matches only part of a
+    longer name does not keep that name.
 
     Each pattern gets :data:`ALLOW_PATTERN_TIME_BUDGET` per call; one that runs out of it
     is ignored for the whole call, so no administrator's pattern can hold the task worker.

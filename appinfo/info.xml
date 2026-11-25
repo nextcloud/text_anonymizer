@@ -64,7 +64,7 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 			<variable>
 				<name>TEXT_ANONYMIZER_ALLOW_PATTERNS</name>
 				<display-name>Allow-list patterns</display-name>
-				<description>Optional. Environment fallback for the admin setting of the same name (Administration settings, ExApps Settings). Regular expressions, one per line; a detected entity whose text matches is kept as-is, for example public company names. Default: empty.</description>
+				<description>Optional. Environment fallback for the admin setting of the same name (Administration settings, ExApps Settings). Regular expressions, one per line; a detected entity is kept as-is when one of them matches its whole text, or when it sits inside a match of one, for example public company names. A pattern that matches only part of a longer name does not keep it. Default: empty.</description>
 			</variable>
 		</environment-variables>
 		<routes>

@@ -165,9 +165,11 @@ def admin_settings_form() -> SettingsForm:
                 type=SettingsFieldType.TEXT,
                 default="",
                 description=(
-                    "Regular expressions, one per line; a detected entity whose text matches,"
-                    " or that sits inside a match, is kept as-is, for example public company"
-                    " names. Default: none."
+                    "Regular expressions, one per line; a detected entity is kept as-is when"
+                    " one of them matches its whole text, or when it sits inside a match of"
+                    " one, for example public company names. A pattern that matches only part"
+                    " of a longer name does not keep it: Paris keeps Paris, not Paris Hilton."
+                    " Default: none."
                 ),
                 placeholder="Nextcloud GmbH",
             ),

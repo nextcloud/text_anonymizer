@@ -45,8 +45,9 @@ overrides the environment variable, and the environment variable overrides the b
   value suggested in the form.
 - `TEXT_ANONYMIZER_IGNORED_ENTITY_TYPES` — comma-separated entity types that are never reported or redacted,
   for example `URL,DATE_TIME`. Default: none.
-- `TEXT_ANONYMIZER_ALLOW_PATTERNS` — regular expressions, one per line; a detected entity whose text matches,
-  or that sits inside a match, is kept as-is, for example public company names. Default: none.
+- `TEXT_ANONYMIZER_ALLOW_PATTERNS` — regular expressions, one per line; a detected entity is kept as-is when one of
+  them matches its whole text, or when it sits inside a match of one, for example public company names. A pattern
+  that matches only part of a longer name does not keep it: `Paris` keeps Paris, not Paris Hilton. Default: none.
 
 Entity types follow Presidio's names, e.g. `PERSON`, `URL` or `DATE_TIME` (see Presidio's
 [list of supported entities](https://presidio.dataprivacystack.org/supported_entities/)).
