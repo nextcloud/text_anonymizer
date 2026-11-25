@@ -290,8 +290,9 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
             nc.notifications.create(f"Could not redact {node.name}", "The file is not a UTF-8 encoded text file.")
             return
         copy_path = redacted_copy_path(nc, node.user_path)
-        # The Files action has no language input surface; English is redact_text's default.
-        nc.files.upload(copy_path, redact_text(text))
+        # The Files action has no language input: the text decides its language, and the
+        # identifiers of every supported language are redacted wherever it found nothing.
+        nc.files.upload(copy_path, redact_text(text, language=None, foreign_identifiers=True))
         nc.notifications.create(f"Redacted copy of {node.name} saved as {posixpath.basename(copy_path)}")
     except Exception as e:
         nc.log(LogLvl.ERROR, f"Failed to redact file {file_info.fileId}: {e}")

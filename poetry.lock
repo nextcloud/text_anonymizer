@@ -2438,6 +2438,24 @@ files = [
 ]
 
 [[package]]
+name = "py3langid"
+version = "0.4.0"
+description = "Fork of the language identification tool langid.py, featuring a modernized codebase and faster execution times."
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "py3langid-0.4.0-py3-none-any.whl", hash = "sha256:c25bd038147951ba3a89efe9ec12cc7d2116cb6f311ff8af84ade398a8bc0616"},
+    {file = "py3langid-0.4.0.tar.gz", hash = "sha256:5924159039b5cc282c2edc10a7ea9363b2099834a0e99ed8d5bea3cc435d7871"},
+]
+
+[package.dependencies]
+numpy = ">=2.0.0"
+
+[package.extras]
+dev = ["pytest", "pytest-cov"]
+
+[[package]]
 name = "pycparser"
 version = "3.12"
 description = "C parser in Python"
@@ -4520,4 +4538,4 @@ test = ["pytest", "pytest-cov"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.15"
-content-hash = "169b4b2af139308efdf1156bd5be6e67ce624fc05762721ce0e52f9fbf317ac8"
+content-hash = "8cbd994aef0bdc3979377e3f527ab6f6ea285eea551eef2c73c7168d13141cc4"

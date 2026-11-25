@@ -41,6 +41,7 @@ from presidio_analyzer.predefined_recognizers import (
 from presidio_analyzer.recognizer_registry import RecognizerRegistry
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
+from py3langid.langid import MODEL_FILE, LanguageIdentifier
 from spacy.util import is_package
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -131,6 +132,9 @@ _ENGINES: tuple[AnalyzerEngine, AnonymizerEngine] | None = None
 _ENGINE_STATE: tuple[str, str | None] = (ENGINE_SPACY, None)
 _NEXT_GLINER_ATTEMPT: tuple[float, int] | None = None
 _GLINER_RETRY_RUNNING = False
+# The language detector is loaded once, under a lock of its own.
+_IDENTIFIER_LOCK = threading.Lock()
+_IDENTIFIER: LanguageIdentifier | None = None
 _KEEP_OPERATORS = {"DEFAULT": OperatorConfig("keep")}
 # Analysis time grows faster than text length, and spaCy rejects texts over 1,000,000 characters.
 CHUNK_SIZE = 10_000
@@ -388,19 +392,58 @@ def _chunk_bounds(text: str, max_size: int) -> list[tuple[int, int]]:
     return bounds
 
 
+def detect_language(text: str, supported: list[str]) -> str | None:
+    """The language of ``text`` if it is one of ``supported``, else None.
+
+    A file has no language input, so its text decides which recognizers analyze it. The detector
+    knows 139 languages: a text in a language the app does not support gets None like a text
+    without words, and is analyzed as English.
+    """
+    global _IDENTIFIER
+    with _IDENTIFIER_LOCK:
+        if _IDENTIFIER is None:
+            _IDENTIFIER = LanguageIdentifier.from_model_file(MODEL_FILE, norm_probs=True)
+        language = _IDENTIFIER.rank(text)[0][0]
+    return language if language in supported else None
+
+
 def _analyze(
-    analyzer: AnalyzerEngine, text: str, language: str, on_progress: ProgressCallback | None
+    analyzer: AnalyzerEngine,
+    text: str,
+    language: str,
+    on_progress: ProgressCallback | None,
+    foreign_identifiers: bool = False,
 ) -> list[RecognizerResult]:
     """Analyze ``text`` chunk by chunk, calling ``on_progress`` with a percentage after each chunk.
 
     The language is resolved against the analyzer's supported languages, so a request for an
-    unsupported language falls back to English instead of failing the task.
+    unsupported language falls back to English instead of failing the task. With
+    ``foreign_identifiers``, every other supported language adds the identifiers that only its
+    recognizers know, except over a span that the text's own language found at least as confidently.
     """
     language = _resolve_language(language, analyzer.supported_languages)
+    own_entities = set(analyzer.get_supported_entities(language)) if foreign_identifiers else set()
+    foreign = (
+        {
+            other: [entity for entity in analyzer.get_supported_entities(other) if entity not in own_entities]
+            for other in analyzer.supported_languages
+            if other != language
+        }
+        if foreign_identifiers
+        else {}
+    )
     bounds = _chunk_bounds(text, CHUNK_SIZE)
     results = []
     for i, (start, end) in enumerate(bounds, 1):
-        for result in analyzer.analyze(text=text[start:end], language=language):
+        chunk_results = analyzer.analyze(text=text[start:end], language=language)
+        for other, entities in foreign.items():
+            if entities:
+                chunk_results += [
+                    result
+                    for result in analyzer.analyze(text=text[start:end], language=other, entities=entities)
+                    if all(result.score > found.score for found in chunk_results if result.intersects(found))
+                ]
+        for result in chunk_results:
             result.start += start
             result.end += start
             results.append(result)
@@ -422,8 +465,17 @@ def detect_pii(text: str, language: str = "en", on_progress: ProgressCallback | 
     return "\n".join(f"{entity_type}: {value}" for entity_type, value in entities)
 
 
-def redact_text(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:
-    """Replace every PII entity in ``text`` with a placeholder naming its type, e.g. ``<PERSON>``."""
+def redact_text(
+    text: str, language: str | None = "en", on_progress: ProgressCallback | None = None, foreign_identifiers: bool = False
+) -> str:
+    """Replace every PII entity in ``text`` with a placeholder naming its type, e.g. ``<PERSON>``.
+
+    ``language=None`` takes the language of the text itself, for a text that comes without one.
+    With ``foreign_identifiers``, the identifiers of the other supported languages are replaced
+    as well.
+    """
     analyzer, anonymizer = _get_engines()
-    results = _analyze(analyzer, text, language, on_progress)
+    if language is None:
+        language = detect_language(text, analyzer.supported_languages) or "en"
+    results = _analyze(analyzer, text, language, on_progress, foreign_identifiers)
     return anonymizer.anonymize(text=text, analyzer_results=results).text
