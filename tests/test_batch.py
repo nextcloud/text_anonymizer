@@ -50,6 +50,8 @@ class FakeFiles:
         self.contents: dict[str, bytes] = {}
         self.uploads: dict[str, bytes] = {}
         self.downloads: list[str] = []
+        #: Folders whose listing fails, as it does for an external storage that is unavailable.
+        self.unlistable: set[str] = set()
         self._next_id = 1000
 
     def add_dir(self, user_path: str, permissions: str = "RGDNVCK") -> FsNode:
@@ -76,6 +78,8 @@ class FakeFiles:
     def listdir(self, path: FsNode | str) -> list[FsNode]:
         # As in nc_py_api, a folder is given as a node or as a user path; ``""`` is the root.
         parent = (path.user_path if isinstance(path, FsNode) else path).strip("/")
+        if parent in self.unlistable:
+            raise NextcloudException(503, "Storage is temporarily unavailable")
         folder = f"{parent}/" if parent else ""
         return [node for user_path, node in self.nodes.items() if _parent_path(user_path) == folder]
 
@@ -407,13 +411,105 @@ def test_folder_batch_ignores_binary_files():
             ("docs/sub/image.jpeg", b"\xff\xd8", "image/jpeg"),
         ]
     )
-    files, oversize, _copies = collect_text_files(nc, docs, NO_LIMIT)
+    files, oversize, _copies, _unreadable = collect_text_files(nc, docs, NO_LIMIT)
     assert [node.user_path for node in files] == ["docs/readme.txt"]
     assert oversize == []
     report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
     assert report.processed_count == 1
     assert nc.files.downloads == ["docs/readme.txt"]
     assert list(nc.files.uploads) == ["docs/readme (redacted).txt"]
+
+
+def unreadable_tree(nc: FakeNc) -> tuple[FsNode, FsNode, FsNode]:
+    """``docs`` with a readable file, the subfolder ``docs/broken`` that cannot be listed, and ``docs/fine``."""
+    docs = nc.files.add_dir("docs")
+    nc.files.add_file("docs/a.txt", b"one", "text/plain")
+    broken = nc.files.add_dir("docs/broken")
+    nc.files.add_file("docs/broken/c.txt", b"three", "text/plain")
+    nc.files.unlistable.add("docs/broken")
+    fine = nc.files.add_dir("docs/fine")
+    nc.files.add_file("docs/fine/b.txt", b"two", "text/plain")
+    return docs, broken, fine
+
+
+def test_folder_batch_goes_on_past_a_subfolder_that_cannot_be_listed(caplog):
+    """An unavailable external storage or share in the tree must not cost the user the files around it."""
+    nc = FakeNc()
+    docs, broken, _fine = unreadable_tree(nc)
+    with caplog.at_level(logging.WARNING, logger="batch"):
+        report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.node.user_path for result in report.redacted] == ["docs/a.txt", "docs/fine/b.txt"]
+    assert nc.files.downloads == ["docs/a.txt", "docs/fine/b.txt"]
+    assert report.failed == [] and report.skipped == []
+    assert report.unreadable_folders == [broken]
+    # The notification counts the folder; the server log names it with the reason.
+    assert "Skipped docs/broken/: the folder could not be listed ([503] Storage is temporarily unavailable)" in caplog.text
+
+
+@pytest.mark.parametrize("status_code", [403, 404, 503])
+def test_folder_batch_leaves_out_a_subfolder_whatever_the_error(status_code):
+    nc = FakeNc()
+    docs, _broken, _fine = unreadable_tree(nc)
+    listdir = nc.files.listdir
+
+    def failing_listdir(path):
+        if (path.user_path if isinstance(path, FsNode) else path).strip("/") == "docs/broken":
+            raise NextcloudException(status_code, "Server error")
+        return listdir(path)
+
+    nc.files.listdir = failing_listdir
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.node.user_path for result in report.redacted] == ["docs/a.txt", "docs/fine/b.txt"]
+    assert len(report.unreadable_folders) == 1
+
+
+def test_folder_batch_still_fails_when_the_folder_itself_cannot_be_listed():
+    """The folder the action was started on is not a subfolder to skip: nothing can be said about it."""
+    nc = FakeNc()
+    docs, _broken, _fine = unreadable_tree(nc)
+    nc.files.unlistable.add("docs")
+    with pytest.raises(NextcloudException):
+        redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert nc.files.uploads == {}
+
+
+@pytest.mark.parametrize(
+    ("unreadable", "sentence"),
+    [(1, "1 folder could not be read."), (2, "2 folders could not be read.")],
+)
+def test_batch_summary_counts_the_folders_that_could_not_be_read(unreadable, sentence):
+    """The user must learn that part of the tree was left out, or they take the folder for done."""
+    nc, docs = build_folder_tree([("docs/a.txt", b"one", "text/plain")])
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    for number in range(unreadable):
+        report.unreadable_folders.append(nc.files.add_dir(f"docs/gone{number}"))
+    main.notify_batch_summary(nc, report)
+    assert nc.notifications.created == [("Redacted text files in docs", f"1 files processed, 1 redacted, 0 failed, 0 skipped. {sentence}")]
+
+
+def test_folder_action_reports_a_folder_that_left_out_a_subfolder(monkeypatch):
+    nc = FakeNc()
+    docs, _broken, _fine = unreadable_tree(nc)
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    monkeypatch.setattr(batch, "redact_text", fake_redact)
+    main.redact_files("admin", [action_info(docs, "dir")])
+    assert sorted(nc.files.uploads) == ["docs/a (redacted).txt", "docs/fine/b (redacted).txt"]
+    assert nc.notifications.created == [
+        ("Redacted text files in docs", "2 files processed, 2 redacted, 0 failed, 0 skipped. 1 folder could not be read.")
+    ]
+
+
+def test_folder_action_with_only_an_unreadable_subfolder_does_not_say_no_text_files(monkeypatch):
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs")
+    nc.files.add_dir("docs/broken")
+    nc.files.unlistable.add("docs/broken")
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    monkeypatch.setattr(batch, "redact_text", fake_redact)
+    main.redact_files("admin", [action_info(docs, "dir")])
+    assert nc.notifications.created == [
+        ("Redacted text files in docs", "0 files processed, 0 redacted, 0 failed, 0 skipped. 1 folder could not be read.")
+    ]
 
 
 def test_collect_text_files_indexes_the_redacted_copies_by_original():
@@ -427,7 +523,7 @@ def test_collect_text_files_indexes_the_redacted_copies_by_original():
             ("docs/report (redacted final).txt", b"not a redacted copy", "text/plain"),
         ]
     )
-    _files, _oversize, copies = collect_text_files(nc, docs, NO_LIMIT)
+    _files, _oversize, copies, _unreadable = collect_text_files(nc, docs, NO_LIMIT)
     assert {original: [copy.user_path for copy in found] for original, found in sorted(copies.items())} == {
         "docs/a.txt": ["docs/a (redacted).txt", "docs/a (redacted 2).txt"],
         "docs/b.md": ["docs/b (redacted).md"],

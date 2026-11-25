@@ -251,11 +251,14 @@ def notify_batch_summary(nc: NextcloudApp, report: BatchReport) -> None:
         )
         return
     # Notification bodies are fetched by every client of the user, so they carry counts only;
-    # the server log names the files that were skipped or failed.
+    # the server log names the files that were skipped or failed and the folders that could not be read.
     message = (
         f"{report.processed_count} files processed, {len(report.redacted)} redacted, "
         f"{len(report.failed)} failed, {len(report.skipped)} skipped."
     )
+    unreadable = len(report.unreadable_folders)
+    if unreadable:
+        message += f" {unreadable} folder{'s' if unreadable > 1 else ''} could not be read."
     nc.notifications.create(f"Redacted text files in {report.folder_name}", message)
 
 

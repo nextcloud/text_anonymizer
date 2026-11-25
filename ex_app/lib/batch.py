@@ -175,6 +175,8 @@ class FileResult:
 class BatchReport:
     folder_name: str
     results: list[FileResult] = field(default_factory=list)
+    """Subfolders that could not be listed; their files are not part of the results."""
+    unreadable_folders: list[FsNode] = field(default_factory=list)
 
     def _with_status(self, status: str) -> list[FileResult]:
         return [result for result in self.results if result.status == status]
@@ -197,24 +199,33 @@ class BatchReport:
 
     @property
     def found_any(self) -> bool:
-        return bool(self.results)
+        return bool(self.results or self.unreadable_folders)
 
 
 def collect_text_files(
     nc: NextcloudApp, folder: FsNode, max_bytes: int
-) -> tuple[list[FsNode], list[FileResult], dict[str, list[FsNode]]]:
-    """Recursively collect text files under ``folder`` as ``(processable, oversize-skipped, redacted-copies)``.
+) -> tuple[list[FsNode], list[FileResult], dict[str, list[FsNode]], list[FsNode]]:
+    """Recursively collect text files under ``folder`` as ``(processable, oversize-skipped, redacted-copies, unreadable)``.
 
     Non-text files are ignored outright; text files over ``max_bytes`` are reported so each can be warned about.
-    ``redacted-copies`` holds every redacted copy found, keyed by the path of its original.
+    ``redacted-copies`` holds every redacted copy found, keyed by the path of its original. ``unreadable`` holds the
+    subfolders that could not be listed; their files are left out. An error on ``folder`` itself propagates.
     """
     files: list[FsNode] = []
     oversize: list[FileResult] = []
     copies: dict[str, list[FsNode]] = {}
+    unreadable: list[FsNode] = []
     folders = [folder]
     while folders:
         current = folders.pop()
-        nodes = nc.files.listdir(current)
+        try:
+            nodes = nc.files.listdir(current)
+        except NextcloudException as e:
+            if current is folder:
+                raise
+            LOGGER.warning("Skipped %s: the folder could not be listed (%s)", current.user_path, e)
+            unreadable.append(current)
+            continue
         for original, found in redacted_copies_by_original(nodes).items():
             copies.setdefault(original, []).extend(found)
         for node in nodes:
@@ -229,7 +240,7 @@ def collect_text_files(
                     LOGGER.warning("Skipped %s: %s", node.user_path, reason)
     files.sort(key=lambda node: node.user_path)
     oversize.sort(key=lambda result: result.node.user_path)
-    return files, oversize, copies
+    return files, oversize, copies, unreadable
 
 
 def redact_file_copy(nc: NextcloudApp, node: FsNode, redact: RedactFn) -> str:
@@ -250,16 +261,16 @@ def redact_folder(
     """Redact every text file under ``folder`` recursively, writing each copy next to its original.
 
     Files are processed one at a time; a failing file is recorded and the run continues, so files redacted
-    before the failure keep their copies. A redacted copy is skipped whatever its age, and a file whose
-    redacted copy is newer than itself is skipped too, so a repeated action on an unchanged folder is a
-    no-op. ``on_progress`` is called with ``(index, total, filename)`` before each file is processed.
+    before the failure keep their copies. A subfolder that cannot be listed is recorded too and its files are
+    left out. A redacted copy is skipped whatever its age, and a file whose redacted copy is newer than itself is
+    skipped too, so a repeated action on an unchanged folder is a no-op. ``on_progress`` is called with
+    ``(index, total, filename)`` before each file is processed.
     """
     if redact is None:
         redact = redact_text
     limit = max_file_bytes() if max_bytes is None else max_bytes
-    report = BatchReport(folder_name=folder.name)
-    files, oversize, copies = collect_text_files(nc, folder, limit)
-    report.results.extend(oversize)
+    files, oversize, copies, unreadable = collect_text_files(nc, folder, limit)
+    report = BatchReport(folder_name=folder.name, results=oversize, unreadable_folders=unreadable)
     total = len(files)
     for index, node in enumerate(files, 1):
         if on_progress is not None:
