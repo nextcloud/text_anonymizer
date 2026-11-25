@@ -10,6 +10,7 @@ import os
 import posixpath
 import re
 import threading
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -196,27 +197,35 @@ def _default_or_none(settings: Settings) -> Settings | None:
     return None if settings == Settings() else settings
 
 
+def _resolve_settings(records: Iterable[Any]) -> Settings | None:
+    """Detection settings: the environment values with the admin-saved appconfig ``records``
+    (what ``appconfig_ex.get_values`` returns) layered on top."""
+    return _default_or_none(apply_admin_config(_env_settings(), {record.key: record.value for record in records}))
+
+
+def _environment_settings(error: Exception) -> Settings | None:
+    """The environment values alone, for when the admin-saved appconfig could not be read."""
+    LOGGER.warning("Admin detection settings could not be read, environment values stay in force: %s", error)
+    return _default_or_none(_env_settings())
+
+
 async def _resolve_task_settings(nc: AsyncNextcloudApp) -> Settings | None:
-    """Detection settings for one task: environment values with admin-saved appconfig
-    layered on top; a failed server read keeps the environment values."""
-    settings = _env_settings()
+    """Detection settings for one task; a failed server read keeps the environment values."""
     try:
         records = await nc.appconfig_ex.get_values(list(ADMIN_CONFIG_KEYS))
-        settings = apply_admin_config(settings, {record.key: record.value for record in records})
     except Exception as e:
-        LOGGER.warning("Admin detection settings could not be read, environment values stay in force: %s", e)
-    return _default_or_none(settings)
+        return _environment_settings(e)
+    return _resolve_settings(records)
 
 
 def _resolve_action_settings(nc: NextcloudApp) -> Settings | None:
-    """Detection settings for a Files action, resolved through ``nc`` like the task settings."""
-    settings = _env_settings()
+    """Detection settings for a Files action, through the synchronous client; a failed server read keeps the
+    environment values."""
     try:
         records = nc.appconfig_ex.get_values(list(ADMIN_CONFIG_KEYS))
-        settings = apply_admin_config(settings, {record.key: record.value for record in records})
     except Exception as e:
-        LOGGER.warning("Admin detection settings could not be read, environment values stay in force: %s", e)
-    return _default_or_none(settings)
+        return _environment_settings(e)
+    return _resolve_settings(records)
 
 
 # Set by `enabled_handler`, which runs in a worker thread.

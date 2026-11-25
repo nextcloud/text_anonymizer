@@ -14,6 +14,7 @@ import main
 from config import (
     ADMIN_CONFIG_KEYS,
     ENV_ALLOW_PATTERNS,
+    ENV_IGNORED_ENTITY_TYPES,
     ENV_SCORE_THRESHOLD,
     Settings,
     filter_results,
@@ -96,3 +97,38 @@ def test_a_warning_about_the_environment_is_logged_once_not_on_every_task(monkey
     assert len(calls) == 1
     assert caplog.text.count(ENV_SCORE_THRESHOLD) == 1
     assert len(nc.calls) == 6  # the admin values are still read for every task and every file action
+
+
+@pytest.mark.parametrize("resolve", [resolve_task, resolve_action], ids=["task", "action"])
+def test_admin_values_are_layered_over_the_environment(resolve, monkeypatch):
+    monkeypatch.setenv(ENV_ALLOW_PATTERNS, "Env Corp")
+    monkeypatch.setenv(ENV_SCORE_THRESHOLD, "0.7")
+    nc = make_nc({ENV_ALLOW_PATTERNS: "Admin Corp", ENV_IGNORED_ENTITY_TYPES: "URL"})
+    assert resolve(nc) == Settings(
+        score_threshold=0.7, ignored_entity_types=frozenset({"URL"}), allow_patterns=("Admin Corp",)
+    )
+    assert len(nc.calls) == 1
+
+
+@pytest.mark.parametrize("resolve", [resolve_task, resolve_action], ids=["task", "action"])
+def test_a_failed_read_keeps_the_environment_values_with_a_warning(resolve, monkeypatch, caplog):
+    monkeypatch.setenv(ENV_ALLOW_PATTERNS, "Env Corp")
+    nc = make_nc(error=RuntimeError("server unreachable"))
+    with caplog.at_level(logging.WARNING, logger="main"):
+        assert resolve(nc) == Settings(allow_patterns=("Env Corp",))
+    assert "Admin detection settings could not be read, environment values stay in force: server unreachable" in caplog.text
+
+
+@pytest.mark.parametrize("resolve", [resolve_task, resolve_action], ids=["task", "action"])
+def test_nothing_set_anywhere_resolves_to_none_so_the_pipeline_runs_unfiltered(resolve):
+    assert resolve(make_nc()) is None
+
+
+@pytest.mark.parametrize("resolve", [resolve_task, resolve_action], ids=["task", "action"])
+def test_the_task_and_the_file_action_share_one_layering(resolve, monkeypatch):
+    """The two resolvers differ by the await of the read only: the layering is one function."""
+    seen = []
+    layer = main._resolve_settings
+    monkeypatch.setattr(main, "_resolve_settings", lambda records: seen.append([r.value for r in records]) or layer(records))
+    assert resolve(make_nc({ENV_ALLOW_PATTERNS: "Admin Corp"})) == Settings(allow_patterns=("Admin Corp",))
+    assert seen == [["Admin Corp"]]
