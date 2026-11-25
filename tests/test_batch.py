@@ -193,6 +193,11 @@ def action_info(node: FsNode, file_type: str) -> ActionFileInfo:
     )
 
 
+def app_api_offers_action(node_mime: str, configured_mime: str) -> bool:
+    """The rule of AppAPI's ``mimeMatches`` (src/filesplugin.js): the node MIME contains one configured value."""
+    return any(part and part in node_mime for part in (value.strip() for value in configured_mime.split(",")))
+
+
 def test_folder_action_registered_for_directories_only():
     nc = FakeNc()
     assert main.enabled_handler(True, nc) == ""
@@ -201,10 +206,11 @@ def test_folder_action_registered_for_directories_only():
     folder_action = registered[main.REDACT_FOLDER_ACTION_NAME]
     assert folder_action["display_name"] == "Redact all text files"
     assert folder_action["mime"] == main.REDACT_FOLDER_ACTION_MIME
-    # AppAPI enables an action when the node MIME contains the configured string.
-    assert main.REDACT_FOLDER_ACTION_MIME in "httpd/unix-directory"
-    assert main.REDACT_FOLDER_ACTION_MIME not in "text/plain"
-    assert main.REDACT_FOLDER_ACTION_MIME not in "application/pdf"
+    # The Files app gives every folder the MIME type "httpd/unix-directory".
+    assert app_api_offers_action("httpd/unix-directory", main.REDACT_FOLDER_ACTION_MIME)
+    # A file type that merely contains "dir" must not get the folder action.
+    for file_mime in ("application/x-director", "inode/directory", "text/directory", "text/plain", "application/pdf"):
+        assert not app_api_offers_action(file_mime, main.REDACT_FOLDER_ACTION_MIME), file_mime
     # The single-file action stays on text files only.
     assert main.REDACT_FILE_ACTION_MIME in "text/plain"
     assert main.REDACT_FILE_ACTION_MIME not in "httpd/unix-directory"

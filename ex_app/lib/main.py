@@ -177,9 +177,9 @@ REDACT_FOLDER_ACTION_NAME = "redact_pii_folder"
 REDACT_FILE_ACTION_HANDLER = "/redact_file"
 # AppAPI matches by substring, so "text/" matches all text/* types but not e.g. ODT documents.
 REDACT_FILE_ACTION_MIME = "text/"
-# Folders report the DAV collection type "httpd/unix-directory", which the substring match catches on "dir";
-# no file MIME type contains "dir".
-REDACT_FOLDER_ACTION_MIME = "dir"
+# The Files app gives every folder the MIME type "httpd/unix-directory"; "dir" alone would also match file
+# types such as "application/x-director".
+REDACT_FOLDER_ACTION_MIME = "unix-directory"
 # AppAPI passes an unset default action to the Files app as `null`, which the Files app treats as a default action.
 # Ordering after the built-in "Download" action (30) keeps any real default action, e.g. "View", ahead of this one.
 REDACT_FILE_ACTION_ORDER = 31
