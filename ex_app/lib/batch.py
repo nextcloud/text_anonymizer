@@ -24,6 +24,11 @@ MAX_FILE_BYTES_ENV = "TEXT_ANONYMIZER_MAX_FILE_BYTES"
 
 REDACTED_SUFFIX_RE = re.compile(r" \(redacted(?: \d+)?\)$")
 
+# Every redacted copy remembers the etag its original had when the copy was made, in the key/value store of the
+# ExApp in Nextcloud (``nc.appconfig_ex``): one record per original, under ``RECORD_KEY_PREFIX`` and its file id.
+RECORD_KEY_PREFIX = "redacted_copy_etag/"
+RECORDS_PER_REQUEST = 200
+
 # Structured-text types are accepted beyond text/* so exports such as JSON and YAML are covered too.
 TEXT_MIMES = frozenset(
     {
@@ -152,22 +157,38 @@ def redacted_copies_by_original(nodes: Iterable[FsNode]) -> dict[str, list[FsNod
     return copies
 
 
+def recorded_etags(nc: NextcloudApp, file_ids: Iterable[int]) -> dict[int, str]:
+    """The etags remembered for the originals ``file_ids``, by file id; an original without a record is left out."""
+    keys = [RECORD_KEY_PREFIX + str(file_id) for file_id in file_ids]
+    recorded: dict[int, str] = {}
+    for start in range(0, len(keys), RECORDS_PER_REQUEST):
+        for record in nc.appconfig_ex.get_values(keys[start : start + RECORDS_PER_REQUEST]):
+            recorded[int(record.key[len(RECORD_KEY_PREFIX) :])] = record.value
+    return recorded
+
+
 def redacted_copy_is_fresh(
-    nc: NextcloudApp, node: FsNode, copies: dict[str, list[FsNode]] | None = None
+    nc: NextcloudApp, node: FsNode, copies: dict[str, list[FsNode]] | None = None, recorded: dict[int, str] | None = None
 ) -> bool:
     """Whether ``node`` is already redacted and up to date, so an action on it is a no-op.
 
-    A redacted copy is never redacted again, whatever its age. A regular file is fresh when one of its
-    redacted copies is newer than the file itself.
+    A redacted copy is never redacted again, whatever its age. A regular file is fresh when a redacted copy of
+    it exists and the etag remembered for it is the etag it has now, i.e. when a copy was made from the content
+    the file still has. The modification time cannot tell that: a restored version or a file that a sync client
+    uploaded with its old local timestamp changes the content and leaves the file no newer than its copy.
 
-    ``copies`` is the index of a folder listing (see ``redacted_copies_by_original``); without it,
-    the folder of ``node`` is listed.
+    ``copies`` is the index of a folder listing (see ``redacted_copies_by_original``); without it, the folder of
+    ``node`` is listed. ``recorded`` is what ``recorded_etags`` returned; without it, the record is read.
     """
     if is_redacted_copy(node.user_path):
         return True
     if copies is None:
         copies = redacted_copies_by_original(nc.files.listdir(posixpath.dirname(node.user_path)))
-    return any(copy.info.last_modified > node.info.last_modified for copy in copies.get(node.user_path, []))
+    if not copies.get(node.user_path):
+        return False
+    if recorded is None:
+        recorded = recorded_etags(nc, [node.info.fileid])
+    return bool(node.etag_unquoted) and recorded.get(node.info.fileid) == node.etag_unquoted
 
 
 @dataclass
@@ -297,6 +318,7 @@ def redact_file_copy(
                 return None
         text = nc.files.download(node).decode("utf-8")
         nc.files.upload(copy_path, redact(text))
+        nc.appconfig_ex.set_value(RECORD_KEY_PREFIX + str(node.info.fileid), node.etag_unquoted)
         return copy_path
 
 
@@ -320,17 +342,21 @@ def redact_folder(
     limit = max_file_bytes() if max_bytes is None else max_bytes
     files, oversize, copies, unreadable = collect_text_files(nc, folder, limit)
     report = BatchReport(folder_name=folder.name, results=oversize, unreadable_folders=unreadable)
-    total = len(files)
+    recorded: dict[int, str] | None = None
     for index, node in enumerate(files, 1):
         if on_progress is not None:
-            on_progress(index, total, node.name)
+            on_progress(index, len(files), node.name)
         try:
             if is_redacted_copy(node.user_path):
                 report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is never redacted again"))
                 continue
-            if redacted_copy_is_fresh(nc, node, copies):
-                report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
-                continue
+            if node.user_path in copies:
+                if recorded is None:
+                    # Only a file with a copy can be up to date, so only those need their remembered etags.
+                    recorded = recorded_etags(nc, [node.info.fileid for node in files if node.user_path in copies])
+                if redacted_copy_is_fresh(nc, node, copies, recorded):
+                    report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
+                    continue
             detail = redact_file_copy(nc, node, redact, copies)
         except UnicodeDecodeError:
             report.results.append(FileResult(node, STATUS_FAILED, "not a UTF-8 encoded text file"))
