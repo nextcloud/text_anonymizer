@@ -9,12 +9,16 @@ German adds its own spaCy model and the DE_* recognizer pack.
 """
 
 import copy
+import json
 import logging
 import os
 import threading
 import time
 from collections.abc import Callable
+from functools import partial
+from pathlib import Path
 
+from huggingface_hub import snapshot_download
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import (
@@ -37,6 +41,8 @@ from presidio_analyzer.recognizer_registry import RecognizerRegistry
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 from spacy.util import is_package
+from tqdm import tqdm
+from transformers import AutoTokenizer
 
 ProgressCallback = Callable[[float], None]
 
@@ -143,6 +149,48 @@ def _supported_languages() -> list[str]:
     return languages
 
 
+class _DownloadProgress(tqdm):
+    """A progress bar of huggingface_hub that hands its percentage to a callback."""
+
+    def __init__(self, *args, on_progress: Callable[[float], None], **kwargs):
+        # huggingface_hub names the bar, which tqdm does not accept.
+        kwargs.pop("name", None)
+        self._on_progress = on_progress
+        super().__init__(*args, **kwargs)
+
+    def display(self, msg=None, pos=None) -> None:
+        if self.total:
+            self._on_progress(self.n / self.total * 100)
+        super().display(msg, pos)
+
+
+def model_cache_dir() -> str | None:
+    """The persistent storage of the app, which survives updates, or None for huggingface_hub's cache.
+
+    AppAPI mounts the storage and passes its path in the environment; without it, for example in
+    a development setup, the model is cached where huggingface_hub puts it by default.
+    """
+    return os.environ.get("APP_PERSISTENT_STORAGE")
+
+
+def download_model(on_progress: Callable[[float], None]) -> bool:
+    """Download the GLiNER model and its tokenizer into the persistent storage of the app.
+
+    A later load of the model then needs no network. ``on_progress`` gets the percentage of the
+    model weights that are downloaded. Nothing is downloaded when the spaCy engine is selected.
+    """
+    if _requested_engine() != ENGINE_GLINER:
+        return False
+    cache_dir = model_cache_dir()
+    model_dir = snapshot_download(
+        GLINER_MODEL, cache_dir=cache_dir, tqdm_class=partial(_DownloadProgress, on_progress=on_progress)
+    )
+    # The tokenizer is a repository of its own, named in the model's configuration.
+    config = Path(model_dir, "gliner_config.json")
+    AutoTokenizer.from_pretrained(json.loads(config.read_text(encoding="utf-8"))["model_name"], cache_dir=cache_dir)
+    return True
+
+
 def _build_gliner_recognizers(languages: list[str]) -> list[GLiNERRecognizer]:
     """One GLiNER recognizer per language. The first loads the model, the others share it.
 
@@ -157,6 +205,7 @@ def _build_gliner_recognizers(languages: list[str]) -> list[GLiNERRecognizer]:
         flat_ner=False,
         multi_label=True,
         map_location="cpu",
+        cache_dir=model_cache_dir(),
     )
     recognizers = [first]
     for language in languages[1:]:

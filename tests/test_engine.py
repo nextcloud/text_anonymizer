@@ -353,6 +353,26 @@ def test_failing_retry_backs_off_and_keeps_the_first_error(monkeypatch):
     assert anonymizer.engine_state() == (anonymizer.ENGINE_SPACY, "OSError: first failure")
 
 
+@pytest.mark.parametrize(("storage", "expected"), [(None, None), ("/nc_app", "/nc_app")])
+def test_gliner_model_is_loaded_from_the_persistent_storage(monkeypatch, storage, expected):
+    """The model is loaded from where the download put it: the storage that survives updates."""
+    from presidio_analyzer.predefined_recognizers.ner import gliner_recognizer
+
+    monkeypatch.setattr(anonymizer, "model_cache_dir", lambda: storage)
+    loads = []
+
+    class RecordingGLiNER:
+        @staticmethod
+        def from_pretrained(model_name, **kwargs):
+            loads.append(kwargs)
+            return object()
+
+    monkeypatch.setattr(gliner_recognizer, "GLiNER", RecordingGLiNER)
+    build_engines(monkeypatch, german_model=True)
+
+    assert [load["cache_dir"] for load in loads] == [expected]
+
+
 def test_engine_env_var_selects_spacy(monkeypatch):
     """TEXT_ANONYMIZER_ENGINE=spacy keeps spaCy NER and never touches GLiNER."""
     monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, anonymizer.ENGINE_SPACY)

@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from anonymizer import detect_pii, engine_state, redact_text
+from anonymizer import detect_pii, download_model, engine_state, redact_text
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +22,7 @@ from nc_py_api.ex_app import (
     AppAPIAuthMiddleware,
     LogLvl,
     anc_app,
+    nc_app,
     run_app,
     set_handlers,
 )
@@ -50,7 +51,7 @@ LANGUAGE_DEFAULTS = {"language": "en"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    set_handlers(app, enabled_handler, trigger_handler=trigger_handler)
+    set_handlers(app, enabled_handler, default_init=False, trigger_handler=trigger_handler)
     if NextcloudApp().enabled_state:
         APP_ENABLED.set()
     worker = asyncio.create_task(process_tasks())
@@ -63,6 +64,25 @@ async def lifespan(app: FastAPI):
 APP = FastAPI(lifespan=lifespan)
 APP.add_middleware(AppAPIAuthMiddleware)  # set global AppAPI authentication middleware
 APP.mount("/img", StaticFiles(directory=Path(__file__).parent.parent / "img"), name="img")
+
+
+def download_model_task(nc: NextcloudApp) -> None:
+    """Download the GLiNER model while AppAPI initialises the app, so that no task waits for it.
+
+    A failed download does not fail the installation: texts are analyzed with the spaCy detection
+    engine until the model is loaded.
+    """
+    try:
+        download_model(lambda percent: nc.set_init_status(min(int(percent), 99)))
+    except Exception as e:
+        LOGGER.warning("The GLiNER model could not be downloaded: %s", e, exc_info=True)
+    nc.set_init_status(100)
+
+
+@APP.post("/init")
+async def init(background_tasks: BackgroundTasks, nc: Annotated[NextcloudApp, Depends(nc_app)]):
+    background_tasks.add_task(download_model_task, nc)
+    return JSONResponse(content={})
 
 DETECT_PII_TASK_TYPE = TaskType(
     id="text_anonymizer:detect_pii",

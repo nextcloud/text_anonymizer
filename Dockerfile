@@ -43,10 +43,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --root-user-action=ignore --no-deps \
         "de_core_news_lg @ ${DE_SPACY_MODEL_URL}#sha256=${DE_SPACY_MODEL_SHA256}"
 
-# The GLiNER model weights (urchade/gliner_multi_pii-v1) are not baked into the image: the
-# Hugging Face hub is unreachable at build time in some environments, so the weights are
-# downloaded on first use and cached under ~/.cache/huggingface; the first task after a
-# fresh start pays the download, later starts reuse the cache.
+# The GLiNER model weights (urchade/gliner_multi_pii-v1, about 1.2 GB) are not part of the image.
+# The app downloads them while AppAPI initialises it, into its persistent storage
+# (APP_PERSISTENT_STORAGE), where they stay over updates and container re-creations. The Hugging
+# Face hub has to be reachable once; without the weights the spaCy detection engine is used, and
+# TEXT_ANONYMIZER_ENGINE=spacy skips the download.
 
 # Download and install FRP client with checksum verification
 # FRP version and checksums - update these when upgrading
