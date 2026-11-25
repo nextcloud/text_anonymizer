@@ -6,6 +6,7 @@
 import asyncio
 import contextlib
 import datetime
+import functools
 import logging
 import logging.handlers
 import posixpath
@@ -55,6 +56,10 @@ class FakeFiles:
         self.nodes: dict[str, FsNode] = {}
         self.contents: dict[str, bytes] = {}
         self.uploads: dict[str, bytes] = {}
+        #: Every upload in order, also the second one to the same path, which ``uploads`` would hide.
+        self.upload_log: list[str] = []
+        #: The folders listed so far, in order: a listing is a request, and a folder run should make one per folder.
+        self.listdir_log: list[str] = []
         self.downloads: list[str] = []
         #: Folders whose listing fails, as it does for an external storage that is unavailable.
         self.unlistable: set[str] = set()
@@ -86,6 +91,7 @@ class FakeFiles:
         parent = (path.user_path if isinstance(path, FsNode) else path).strip("/")
         if parent in self.unlistable:
             raise NextcloudException(503, "Storage is temporarily unavailable")
+        self.listdir_log.append(parent)
         folder = f"{parent}/" if parent else ""
         return [node for user_path, node in self.nodes.items() if _parent_path(user_path) == folder]
 
@@ -107,6 +113,7 @@ class FakeFiles:
     def upload(self, path: str, content) -> FsNode:
         data = content.encode() if isinstance(content, str) else content
         self.uploads[path] = data
+        self.upload_log.append(path)
         # Each upload is a minute later than the previous one, as on a real storage.
         uploaded_at = self.UPLOADED_AT + datetime.timedelta(minutes=len(self.uploads) - 1)
         return self.add_file(path, data, "text/plain", last_modified=uploaded_at)
@@ -692,23 +699,174 @@ def test_files_action_accepts_the_folder_file_type(monkeypatch):
     assert "docs/a (redacted).txt" in nc.files.uploads
 
 
-def test_double_dispatch_redacts_each_file_once(monkeypatch):
-    """Two concurrent dispatches of one folder action produce a single copy per file."""
+def run_in_threads(*targets) -> None:
+    """Run each target in a thread of its own and wait for all of them; a failure inside a thread fails here."""
+    failures: list[BaseException] = []
+
+    def guarded(target):
+        try:
+            target()
+        except BaseException as failure:  # noqa  pylint: disable=broad-exception-caught
+            failures.append(failure)
+
+    threads = [threading.Thread(target=guarded, args=(target,), name=f"thread {number}") for number, target in enumerate(targets)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "a thread did not end: the actions wait for each other"
+    assert not failures, failures
+
+
+def test_double_dispatch_redacts_each_file_once_and_sends_one_summary(monkeypatch):
+    """A double click dispatches the same folder action twice: one run redacts, the other is dropped."""
     nc = FakeNc()
     docs = nc.files.add_dir("docs")
     nc.files.add_file("docs/a.txt", b"one", "text/plain")
     nc.files.add_file("docs/b.txt", b"two", "text/plain")
     monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
-    monkeypatch.setattr(batch, "redact_text", fake_redact)
-    dispatches = [
-        threading.Thread(target=main.redact_files, args=("admin", [action_info(docs, "dir")]))
-        for _ in range(2)
-    ]
-    for thread in dispatches:
-        thread.start()
-    for thread in dispatches:
-        thread.join()
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_redact(text):
+        started.set()
+        assert release.wait(timeout=10)
+        return fake_redact(text)
+
+    monkeypatch.setattr(batch, "redact_text", slow_redact)
+    first = threading.Thread(target=main.redact_files, args=("admin", [action_info(docs, "dir")]), name="first")
+    first.start()
+    assert started.wait(timeout=10)
+    # The second dispatch returns at once, while the first run still works on its first file.
+    main.redact_files("admin", [action_info(docs, "dir")])
+    release.set()
+    first.join(timeout=10)
+    assert not first.is_alive()
     assert sorted(nc.files.uploads) == ["docs/a (redacted).txt", "docs/b (redacted).txt"]
+    assert [subject for subject, _message in nc.notifications.created] == ["Redacted text files in docs"]
+
+
+def test_folder_run_and_file_action_on_one_file_write_one_copy(monkeypatch):
+    """Both reach a file before either has uploaded: one writes the copy, the other finds it."""
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs")
+    node = nc.files.add_file("docs/a.txt", b"one", "text/plain")
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+
+    def slow_redact(text):
+        time.sleep(0.3)
+        return fake_redact(text)
+
+    monkeypatch.setattr(batch, "redact_text", slow_redact)
+    monkeypatch.setattr(main, "redact_text", slow_redact)
+    run_in_threads(
+        lambda: main.redact_files("admin", [action_info(docs, "dir")]),
+        lambda: main.redact_files("admin", [action_info(node, "file")]),
+    )
+    assert nc.files.upload_log == ["docs/a (redacted).txt"]
+    subjects = [subject for subject, _message in nc.notifications.created]
+    assert sum(subject.startswith("Redacted text files in docs") for subject in subjects) == 1
+    # Whoever wrote the copy, the other action found it.
+    assert "A redacted copy of a.txt is already up to date" in subjects or "Redacted copy of a.txt saved as a (redacted).txt" in subjects
+    assert batch._FILE_LOCKS == {} and main._ACTIONS_RUNNING == set()
+
+
+def test_a_folder_run_lists_each_folder_once():
+    """The listing of a folder is one request whatever its size; it must not be repeated for every file."""
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs")
+    nc.files.add_dir("docs/sub")
+    for name in ("docs/a.txt", "docs/b.md", "docs/sub/c.txt", "docs/sub/d.json"):
+        nc.files.add_file(name, b"one", "text/plain")
+    redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert len(nc.files.uploads) == 4
+    assert nc.files.listdir_log == ["docs", "docs/sub"]
+
+
+def test_folder_run_sees_the_copy_a_file_action_wrote_meanwhile(monkeypatch):
+    """The folder run listed its folder before the file action wrote a copy of one of its files."""
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs")
+    nc.files.add_file("docs/01-blocking.txt", b"one", "text/plain")
+    later = nc.files.add_file("docs/02-later.txt", b"two", "text/plain")
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    blocked = threading.Event()
+    release = threading.Event()
+
+    def redact(text):
+        if text == "one":
+            blocked.set()
+            assert release.wait(timeout=10)
+        return fake_redact(text)
+
+    monkeypatch.setattr(batch, "redact_text", redact)
+    monkeypatch.setattr(main, "redact_text", redact)
+    folder_run = threading.Thread(target=main.redact_files, args=("admin", [action_info(docs, "dir")]))
+    folder_run.start()
+    assert blocked.wait(timeout=10)
+    main.redact_files("admin", [action_info(later, "file")])
+    release.set()
+    folder_run.join(timeout=10)
+    assert not folder_run.is_alive()
+    assert sorted(nc.files.upload_log) == ["docs/01-blocking (redacted).txt", "docs/02-later (redacted).txt"]
+    assert [subject for subject, _message in nc.notifications.created] == [
+        "Redacted copy of 02-later.txt saved as 02-later (redacted).txt",
+        "Redacted text files in docs",
+    ]
+    assert batch._FILE_LOCKS == {} and main._ACTIONS_RUNNING == set()
+
+
+def test_file_lock_holds_one_lock_per_file_and_drops_it_afterwards():
+    """Waiting threads share the lock of the holder; nothing is kept once the last one has left."""
+    entered = []
+    inside = 0
+
+    def use(number):
+        nonlocal inside
+        with batch._file_lock(42):
+            assert inside == 0
+            inside = 1
+            entered.append(number)
+            time.sleep(0.005)
+            inside = 0
+
+    run_in_threads(*[functools.partial(use, number) for number in range(8)])
+    with batch._file_lock(42):
+        assert list(batch._FILE_LOCKS) == [42]
+    assert sorted(entered) == list(range(8))
+    assert batch._FILE_LOCKS == {}
+
+
+def test_file_lock_keeps_its_entry_while_a_thread_waits_for_it():
+    """A thread that waits for the lock counts as a user of it: no second lock can be made for the file meanwhile."""
+    holding = threading.Event()
+    release = threading.Event()
+    passed = []
+
+    def holder():
+        with batch._file_lock(7):
+            holding.set()
+            release.wait(timeout=10)
+
+    def waiter():
+        with batch._file_lock(7):
+            passed.append("waiter")
+
+    holder_thread = threading.Thread(target=holder)
+    holder_thread.start()
+    assert holding.wait(timeout=10)
+    waiter_thread = threading.Thread(target=waiter)
+    waiter_thread.start()
+    deadline = time.monotonic() + 10
+    while batch._FILE_LOCKS.get(7, (None, 0))[1] < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert batch._FILE_LOCKS[7][1] == 2  # the holder and the one who waits
+    release.set()
+    for thread in (holder_thread, waiter_thread):
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert passed == ["waiter"]
+    assert batch._FILE_LOCKS == {}
 
 
 def test_edited_original_gets_a_new_copy_and_the_old_one_stays(monkeypatch):

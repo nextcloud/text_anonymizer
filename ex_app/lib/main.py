@@ -4,6 +4,7 @@
 """ExApp server providing TaskProcessing tasks and a Files action for detecting and redacting PII."""
 
 import asyncio
+import functools
 import logging
 import logging.handlers
 import os
@@ -11,13 +12,14 @@ import posixpath
 import queue
 import threading
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any
 
 from anonymizer import detect_pii, redact_text
 from batch import LOGGER as BATCH_LOGGER
-from batch import BatchReport, oversize_detail, redacted_copy_is_fresh, redact_folder, redacted_copy_path
+from batch import BatchReport, oversize_detail, redact_file_copy, redact_folder
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -245,17 +247,15 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
         if reason is not None:
             nc.notifications.create(f"Could not redact {node.name}", f"The file is {reason} and was skipped.")
             return
-        if redacted_copy_is_fresh(nc, node):
-            nc.notifications.create(f"A redacted copy of {node.name} is already up to date")
-            return
+        # The Files action has no language input surface; English is redact_text's default.
         try:
-            text = nc.files.download(node).decode("utf-8")
+            copy_path = redact_file_copy(nc, node, redact_text)
         except UnicodeDecodeError:
             nc.notifications.create(f"Could not redact {node.name}", "The file is not a UTF-8 encoded text file.")
             return
-        copy_path = redacted_copy_path(nc, node.user_path)
-        # The Files action has no language input surface; English is redact_text's default.
-        nc.files.upload(copy_path, redact_text(text))
+        if copy_path is None:
+            nc.notifications.create(f"A redacted copy of {node.name} is already up to date")
+            return
         nc.notifications.create(f"Redacted copy of {node.name} saved as {posixpath.basename(copy_path)}")
     except Exception as e:
         nc.log(LogLvl.ERROR, f"Failed to redact file {file_info.fileId}: {e}")
@@ -311,32 +311,35 @@ def notify_batch_summary(nc: NextcloudApp, report: BatchReport) -> None:
     nc.notifications.create(f"Redacted text files in {report.folder_name}", message)
 
 
-# Files actions run as background tasks, and a double click can dispatch the same action twice
-# within about a second; duplicate dispatches are serialized per node, so one pass redacts and
-# the repeat hits the fresh-copy guard instead of racing it into duplicate copies.
-_ACTION_LOCKS: dict[int, threading.Lock] = {}
-_ACTION_LOCKS_GUARD = threading.Lock()
+# Files actions run as background tasks, and a double click can dispatch the same action twice within about a
+# second. A second action on the same node of the same user is dropped while the first one runs: it could only
+# wait for the first one and then report its files as skipped. Copies are kept unique by the lock of each
+# original file (see ``redact_file_copy``), which also covers a folder run and a file action on one file.
+_ACTIONS_RUNNING: set[tuple[str, int]] = set()
+_ACTIONS_RUNNING_GUARD = threading.Lock()
 
 
-def _action_lock(file_id: int) -> threading.Lock:
-    """The process-wide lock serializing redaction actions for one node."""
-    with _ACTION_LOCKS_GUARD:
-        if file_id not in _ACTION_LOCKS:
-            _ACTION_LOCKS[file_id] = threading.Lock()
-        return _ACTION_LOCKS[file_id]
+def _run_once_per_node(user_id: str, file_id: int, action: Callable[[], None]) -> None:
+    """Run ``action`` unless an action on the same node of the same user runs already."""
+    with _ACTIONS_RUNNING_GUARD:
+        if (user_id, file_id) in _ACTIONS_RUNNING:
+            return
+        _ACTIONS_RUNNING.add((user_id, file_id))
+    try:
+        action()
+    finally:
+        with _ACTIONS_RUNNING_GUARD:
+            _ACTIONS_RUNNING.discard((user_id, file_id))
 
 
 def redact_files(user_id: str, files: list[ActionFileInfo]) -> None:
     nc = NextcloudApp()
     nc.set_user(user_id)
     for file_info in files:
-        with _action_lock(file_info.fileId):
-            # AppAPI's Files payload reports directories as "folder" (current files plugin)
-            # or "dir" (older payloads); both dispatch to the folder action.
-            if file_info.fileType.lower() in ("dir", "folder"):
-                redact_folder_action(nc, file_info)
-            else:
-                redact_file(nc, file_info)
+        # AppAPI's Files payload reports directories as "folder" (current files plugin)
+        # or "dir" (older payloads); both dispatch to the folder action.
+        redact = redact_folder_action if file_info.fileType.lower() in ("dir", "folder") else redact_file
+        _run_once_per_node(user_id, file_info.fileId, functools.partial(redact, nc, file_info))
 
 
 @APP.post(REDACT_FILE_ACTION_HANDLER)

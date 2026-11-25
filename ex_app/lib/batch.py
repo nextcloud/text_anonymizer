@@ -7,7 +7,9 @@ import logging
 import os
 import posixpath
 import re
-from collections.abc import Callable, Iterable
+import threading
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from anonymizer import redact_text
@@ -110,18 +112,23 @@ def canonical_redacted_copy_path(user_path: str) -> str:
     return _redacted_copy_path(user_path, " (redacted)")
 
 
+def _free_copy_path(user_path: str, taken: Callable[[str], bool]) -> str:
+    """The first candidate path for the redacted copy of ``user_path`` that ``taken`` does not report as taken."""
+    candidate = canonical_redacted_copy_path(user_path)
+    counter = 2
+    while taken(candidate):
+        candidate = _redacted_copy_path(user_path, f" (redacted {counter})")
+        counter += 1
+    return candidate
+
+
 def redacted_copy_path(nc: NextcloudApp, user_path: str) -> str:
     """Return a free path next to ``user_path`` for the redacted copy, e.g. ``notes (redacted).txt``.
 
     A taken candidate is numbered: an original that is redacted again while ``notes (redacted).txt``
     exists gets ``notes (redacted 2).txt``.
     """
-    candidate = canonical_redacted_copy_path(user_path)
-    counter = 2
-    while path_exists(nc, candidate):
-        candidate = _redacted_copy_path(user_path, f" (redacted {counter})")
-        counter += 1
-    return candidate
+    return _free_copy_path(user_path, lambda candidate: path_exists(nc, candidate))
 
 
 def _original_path(user_path: str) -> str:
@@ -243,12 +250,54 @@ def collect_text_files(
     return files, oversize, copies, unreadable
 
 
-def redact_file_copy(nc: NextcloudApp, node: FsNode, redact: RedactFn) -> str:
-    """Write a redacted copy of ``node`` next to the original and return the copy's path."""
-    text = nc.files.download(node).decode("utf-8")
-    copy_path = redacted_copy_path(nc, node.user_path)
-    nc.files.upload(copy_path, redact(text))
-    return copy_path
+# An original is redacted while the lock of its file id is held, so that two actions on the same file, such as
+# a folder run and a file action on a file of that folder, never write the same copy. The locks live in this
+# process only: they cover the actions that run in the threads of one ExApp process.
+_FILE_LOCKS: dict[int, tuple[threading.Lock, int]] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _file_lock(file_id: int) -> Iterator[None]:
+    """Hold the lock of the file while the block runs; the lock goes once its last holder and waiter are gone."""
+    with _FILE_LOCKS_GUARD:
+        lock, users = _FILE_LOCKS.get(file_id, (threading.Lock(), 0))
+        _FILE_LOCKS[file_id] = (lock, users + 1)
+    try:
+        with lock:
+            yield
+    finally:
+        with _FILE_LOCKS_GUARD:
+            lock, users = _FILE_LOCKS[file_id]
+            if users == 1:
+                del _FILE_LOCKS[file_id]
+            else:
+                _FILE_LOCKS[file_id] = (lock, users - 1)
+
+
+def redact_file_copy(
+    nc: NextcloudApp, node: FsNode, redact: RedactFn, copies: dict[str, list[FsNode]] | None = None
+) -> str | None:
+    """Write a redacted copy of ``node`` next to the original and return the copy's path.
+
+    Returns ``None`` when a copy is up to date by then. The check runs under the lock of the original, because
+    another action may have written the copy since ``node`` was found: against a new listing, or, when
+    ``copies`` is the index of the listing that found ``node``, only if the first free path is no longer the one
+    that index announces, i.e. if a copy appeared since.
+    """
+    with _file_lock(node.info.fileid):
+        if copies is None:
+            if redacted_copy_is_fresh(nc, node):
+                return None
+            copy_path = redacted_copy_path(nc, node.user_path)
+        else:
+            copy_path = redacted_copy_path(nc, node.user_path)
+            taken = {copy.user_path for copy in copies.get(node.user_path, [])}
+            if copy_path != _free_copy_path(node.user_path, taken.__contains__) and redacted_copy_is_fresh(nc, node):
+                return None
+        text = nc.files.download(node).decode("utf-8")
+        nc.files.upload(copy_path, redact(text))
+        return copy_path
 
 
 def redact_folder(
@@ -282,12 +331,15 @@ def redact_folder(
             if redacted_copy_is_fresh(nc, node, copies):
                 report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
                 continue
-            detail = redact_file_copy(nc, node, redact)
+            detail = redact_file_copy(nc, node, redact, copies)
         except UnicodeDecodeError:
             report.results.append(FileResult(node, STATUS_FAILED, "not a UTF-8 encoded text file"))
         except Exception as e:
             LOGGER.exception("Failed to redact %s", node.user_path)
             report.results.append(FileResult(node, STATUS_FAILED, str(e) or e.__class__.__name__))
         else:
-            report.results.append(FileResult(node, STATUS_REDACTED, detail))
+            if detail is None:
+                report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
+            else:
+                report.results.append(FileResult(node, STATUS_REDACTED, detail))
     return report
