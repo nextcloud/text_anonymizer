@@ -4,11 +4,11 @@
 """PII detection and redaction using Presidio."""
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
+from presidio_anonymizer.entities import OperatorConfig, OperatorResult
 
 ProgressCallback = Callable[[float], None]
 
@@ -47,20 +47,39 @@ def _chunk_bounds(text: str, max_size: int) -> list[tuple[int, int]]:
     return bounds
 
 
+def _analyze_chunks(
+    analyzer: AnalyzerEngine, text: str, language: str, on_progress: ProgressCallback | None
+) -> Iterator[tuple[int, int, list[RecognizerResult]]]:
+    """Yield ``(start, end, results)`` for each chunk ``text[start:end]``, the results positioned in the chunk.
+
+    Calls ``on_progress`` with the percentage of the text analyzed after each chunk.
+    """
+    bounds = _chunk_bounds(text, CHUNK_SIZE)
+    for i, (start, end) in enumerate(bounds, 1):
+        results = analyzer.analyze(text=text[start:end], language=language)
+        if on_progress:
+            on_progress(i / len(bounds) * 100)
+        yield start, end, results
+
+
 def _analyze(
     analyzer: AnalyzerEngine, text: str, language: str, on_progress: ProgressCallback | None
 ) -> list[RecognizerResult]:
-    """Analyze ``text`` chunk by chunk, calling ``on_progress`` with a percentage after each chunk."""
-    bounds = _chunk_bounds(text, CHUNK_SIZE)
+    """Analyze ``text`` chunk by chunk, returning the results with their positions in the whole text."""
     results = []
-    for i, (start, end) in enumerate(bounds, 1):
-        for result in analyzer.analyze(text=text[start:end], language=language):
+    for start, _, chunk_results in _analyze_chunks(analyzer, text, language, on_progress):
+        for result in chunk_results:
             result.start += start
             result.end += start
-            results.append(result)
-        if on_progress:
-            on_progress(i / len(bounds) * 100)
+        results.extend(chunk_results)
     return results
+
+
+def _resolve_overlaps(
+    anonymizer: AnonymizerEngine, text: str, results: list[RecognizerResult]
+) -> list[OperatorResult]:
+    """Return the entities left after resolving the overlaps in ``results`` as :func:`redact_text` does."""
+    return anonymizer.anonymize(text=text, analyzer_results=results, operators=_KEEP_OPERATORS).items
 
 
 def detect_pii(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:
@@ -70,8 +89,7 @@ def detect_pii(text: str, language: str = "en", on_progress: ProgressCallback | 
     redacted. Returns an empty string if no PII was found.
     """
     analyzer, anonymizer = _get_engines()
-    results = _analyze(analyzer, text, language, on_progress)
-    items = anonymizer.anonymize(text=text, analyzer_results=results, operators=_KEEP_OPERATORS).items
+    items = _resolve_overlaps(anonymizer, text, _analyze(analyzer, text, language, on_progress))
     entities = dict.fromkeys((item.entity_type, item.text) for item in sorted(items, key=lambda item: item.start))
     return "\n".join(f"{entity_type}: {value}" for entity_type, value in entities)
 
@@ -79,12 +97,16 @@ def detect_pii(text: str, language: str = "en", on_progress: ProgressCallback | 
 def contains_pii(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> bool:
     """Return whether ``text`` holds an entity that can identify a person.
 
-    Entity types in ``NON_IDENTIFYING_TYPES`` do not count. Overlap resolution can only drop
-    entities, never add them, so scanning the raw analyzer results is enough and the (slower)
-    resolution pass is skipped.
+    Overlapping entities are resolved as in :func:`detect_pii` before ``NON_IDENTIFYING_TYPES`` are left out, so
+    the answer agrees with what the other tasks report. The chunks after the first one holding such an entity are
+    not analyzed.
     """
-    analyzer, _ = _get_engines()
-    return any(r.entity_type not in NON_IDENTIFYING_TYPES for r in _analyze(analyzer, text, language, on_progress))
+    analyzer, anonymizer = _get_engines()
+    for start, end, chunk_results in _analyze_chunks(analyzer, text, language, on_progress):
+        items = _resolve_overlaps(anonymizer, text[start:end], chunk_results)
+        if any(item.entity_type not in NON_IDENTIFYING_TYPES for item in items):
+            return True
+    return False
 
 
 def redact_text(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:

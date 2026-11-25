@@ -27,6 +27,20 @@ class FakeAnalyzer:
         return self.results
 
 
+class ChunkAnalyzer:
+    """AnalyzerEngine stand-in that finds ``name`` as a PERSON in every chunk holding it, and counts its calls."""
+
+    supported_languages = ["en"]
+
+    def __init__(self, name: str = "Alice") -> None:
+        self.name = name
+        self.chunks: list[str] = []
+
+    def analyze(self, text: str, language: str) -> list[RecognizerResult]:
+        self.chunks.append(text)
+        return [entity("PERSON", self.name, text)] if self.name in text else []
+
+
 @pytest.fixture
 def set_engines(monkeypatch: pytest.MonkeyPatch):
     """Patch ``anonymizer._get_engines`` to return a fake analyzer plus a real anonymizer engine."""
@@ -80,6 +94,61 @@ def test_contains_pii_counts_locations(set_engines) -> None:
     assert main.TASK_HANDLERS["text_anonymizer:contains_pii"]({"input": "Our office is in Springfield."}) == {
         "contains_pii": "true"
     }
+
+
+def test_contains_pii_resolves_overlaps_like_the_other_tasks(set_engines) -> None:
+    cases = [
+        # The date wins the overlap, so the other tasks report nothing identifying.
+        ("June was a busy month.", [("DATE_TIME", "June", 0.9), ("PERSON", "June", 0.5)], False),
+        ("Geburtsdatum: 03.04.1985", [("DATE_TIME", "03.04.1985", 0.6), ("PHONE_NUMBER", "03.04.1985", 0.4)], False),
+        # The identifying entity wins the overlap.
+        ("June was a busy month.", [("PERSON", "June", 0.9), ("DATE_TIME", "June", 0.5)], True),
+    ]
+    for whole, results, expected in cases:
+        set_engines([entity(entity_type, value, whole, score) for entity_type, value, score in results])
+        reported = [line for line in anonymizer.detect_pii(whole).splitlines() if not line.startswith("DATE_TIME:")]
+        assert bool(reported) is expected, whole
+        assert anonymizer.contains_pii(whole) is expected, whole
+        assert main.TASK_HANDLERS["text_anonymizer:contains_pii"]({"input": whole}) == {
+            "contains_pii": "true" if expected else "false"
+        }, whole
+
+
+def test_contains_pii_stops_at_the_first_chunk_with_pii(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(anonymizer, "CHUNK_SIZE", 50)
+    lines = [f"Line {i} of an ordinary text.\n" for i in range(4)]
+    cases = [
+        # The line holding the name and the progress reported until the answer is known.
+        (0, [25.0]),
+        (2, [25.0, 50.0, 75.0]),
+        (None, [25.0, 50.0, 75.0, 100.0]),
+    ]
+    for line_number, progress in cases:
+        chunked = list(lines)
+        if line_number is not None:
+            chunked[line_number] = "Alice can be reached at bob@example.com.\n"
+        text = "".join(chunked)
+        analyzer = ChunkAnalyzer()
+        monkeypatch.setattr(anonymizer, "_get_engines", lambda: (analyzer, AnonymizerEngine()))
+        reported = []
+        assert anonymizer.contains_pii(text, on_progress=reported.append) is (line_number is not None), line_number
+        assert reported == progress, line_number
+        # Every chunk ends at a line break, so the chunk holding the name is the last one analyzed.
+        analyzed = text if line_number is None else "".join(chunked[: line_number + 1])
+        assert "".join(analyzer.chunks) == analyzed, line_number
+
+
+def test_detect_pii_and_redact_text_reach_every_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(anonymizer, "CHUNK_SIZE", 50)
+    analyzer = ChunkAnalyzer()
+    monkeypatch.setattr(anonymizer, "_get_engines", lambda: (analyzer, AnonymizerEngine()))
+    text = "".join(f"Line {i} of an ordinary text.\n" for i in range(4))
+    text = text[:56] + "Alice can be reached at bob@example.com.\n" + text[84:]
+    assert anonymizer.detect_pii(text) == "PERSON: Alice"
+    assert len(analyzer.chunks) == 4
+    analyzer.chunks.clear()
+    assert anonymizer.redact_text(text) == text.replace("Alice", "<PERSON>")
+    assert len(analyzer.chunks) == 4
 
 
 def test_redact_handler_without_mode_is_unchanged(set_engines) -> None:
