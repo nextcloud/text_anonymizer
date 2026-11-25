@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from anonymizer import detect_pii, redact_text
+from anonymizer import detect_pii, engine_state, redact_text
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -157,6 +157,24 @@ async def wait_for_trigger(timeout: float) -> bool:
     return True
 
 
+# The engine state that was last reported to the Nextcloud log.
+_LAST_ENGINE_STATE: tuple[str, str | None] | None = None
+_ENGINE_STATE_LOCK = threading.Lock()
+
+
+def engine_notice() -> str | None:
+    """The message for the Nextcloud log if the engine fell back to spaCy or loaded GLiNER again."""
+    global _LAST_ENGINE_STATE
+    with _ENGINE_STATE_LOCK:
+        previous, state = _LAST_ENGINE_STATE, engine_state()
+        _LAST_ENGINE_STATE = state
+    if state[1] is not None and state != previous:
+        return f"The GLiNER model could not be loaded ({state[1]}). Texts are analyzed with the spaCy detection engine until loading it succeeds."
+    if state[1] is None and previous is not None and previous[1] is not None:
+        return "The GLiNER model is loaded. Texts are analyzed with the GLiNER detection engine again."
+    return None
+
+
 async def process_task(nc: AsyncNextcloudApp, task: dict[str, Any]) -> None:
     loop = asyncio.get_running_loop()
 
@@ -192,6 +210,9 @@ async def process_tasks() -> None:
             response = await nc.providers.task_processing.next_task(provider_ids, task_types)
             if response:
                 await process_task(nc, response["task"])
+                notice = engine_notice()
+                if notice:
+                    await nc.log(LogLvl.WARNING, notice)
             elif await wait_for_trigger(poll_interval):
                 poll_interval = POLL_INTERVAL_WITH_TRIGGER
         except Exception:
@@ -262,6 +283,9 @@ def redact_files(user_id: str, files: list[ActionFileInfo]) -> None:
     nc.set_user(user_id)
     for file_info in files:
         redact_file(nc, file_info)
+    notice = engine_notice()
+    if notice:
+        nc.log(LogLvl.WARNING, notice)
 
 
 @APP.post(REDACT_FILE_ACTION_HANDLER)

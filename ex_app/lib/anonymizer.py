@@ -12,6 +12,7 @@ import copy
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
@@ -32,6 +33,7 @@ from presidio_analyzer.predefined_recognizers import (
     DeVatIdRecognizer,
     GLiNERRecognizer,
 )
+from presidio_analyzer.recognizer_registry import RecognizerRegistry
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 from spacy.util import is_package
@@ -104,8 +106,16 @@ GERMAN_CARD_CONTEXT = [
     "amex",
 ]
 
+# Seconds to wait before the GLiNER model is loaded again after a failed attempt; the last
+# value then repeats.
+GLINER_RETRY_DELAYS = (60, 300, 1800, 3600)
+
 _LOCK = threading.Lock()
 _ENGINES: tuple[AnalyzerEngine, AnonymizerEngine] | None = None
+# The engine in use and, while GLiNER is the requested engine but could not be loaded, the error.
+_ENGINE_STATE: tuple[str, str | None] = (ENGINE_SPACY, None)
+_NEXT_GLINER_ATTEMPT: tuple[float, int] | None = None
+_GLINER_RETRY_RUNNING = False
 _KEEP_OPERATORS = {"DEFAULT": OperatorConfig("keep")}
 # Analysis time grows faster than text length, and spaCy rejects texts over 1,000,000 characters.
 CHUNK_SIZE = 10_000
@@ -161,16 +171,17 @@ def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
 
     All language instances share one loaded model. If loading fails for any reason (gliner
     package missing, model download unavailable), the spaCy recognizers are kept as the
-    fallback engine.
+    fallback engine and the load is tried again later.
     """
     try:
         recognizers = _build_gliner_recognizers(languages)
-    except Exception:
+    except Exception as error:
         LOGGER.warning(
             "The GLiNER model %s could not be loaded, using the spaCy detection engine",
             GLINER_MODEL,
             exc_info=True,
         )
+        _schedule_gliner_retry(error)
         return False
 
     for recognizer in recognizers:
@@ -181,6 +192,7 @@ def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
 
 def _build_engines() -> tuple[AnalyzerEngine, AnonymizerEngine]:
     """Create the analyzer and anonymizer with the recognizer set for every supported language."""
+    global _ENGINE_STATE
     languages = _supported_languages()
     nlp_engine = NlpEngineProvider(
         nlp_configuration={
@@ -193,24 +205,88 @@ def _build_engines() -> tuple[AnalyzerEngine, AnonymizerEngine]:
         for recognizer in GERMAN_RECOGNIZERS:
             analyzer.registry.add_recognizer(recognizer(supported_language="de"))
         analyzer.registry.add_recognizer(CreditCardRecognizer(supported_language="de", context=GERMAN_CARD_CONTEXT))
-    if _requested_engine() == ENGINE_GLINER:
-        engine = ENGINE_GLINER if _enable_gliner(analyzer, languages) else ENGINE_SPACY
-    else:
-        # The fallback keeps the multi-language recognizer configuration built above: the German
-        # recognizers stay active whenever the German spaCy model is installed, so the fallback
-        # engine differs from the GLiNER engine only by the missing zero-shot model.
-        engine = ENGINE_SPACY
+    # The spaCy engine keeps the recognizer configuration built above: the German recognizers
+    # stay active whenever the German spaCy model is installed, so it differs from the GLiNER
+    # engine only by the missing zero-shot model.
+    engine = ENGINE_SPACY
+    if _requested_engine() == ENGINE_GLINER and _enable_gliner(analyzer, languages):
+        engine = ENGINE_GLINER
+        _ENGINE_STATE = (ENGINE_GLINER, None)
     LOGGER.info("Detection engine: %s (languages: %s)", engine, languages)
     return analyzer, AnonymizerEngine()
 
 
+def _schedule_gliner_retry(error: Exception) -> None:
+    """Remember a failed GLiNER load and when to try again. Called with ``_LOCK`` held."""
+    global _NEXT_GLINER_ATTEMPT, _ENGINE_STATE
+    error_class = type(error).__name__
+    recorded = _ENGINE_STATE[1]
+    if recorded is None or recorded.split(":", 1)[0] != error_class:
+        _ENGINE_STATE = (ENGINE_SPACY, f"{error_class}: {error}")
+    if isinstance(error, ImportError):
+        # Without the gliner package no attempt can succeed.
+        _NEXT_GLINER_ATTEMPT = None
+        return
+    index = 0 if _NEXT_GLINER_ATTEMPT is None else min(_NEXT_GLINER_ATTEMPT[1] + 1, len(GLINER_RETRY_DELAYS) - 1)
+    _NEXT_GLINER_ATTEMPT = (time.monotonic() + GLINER_RETRY_DELAYS[index], index)
+
+
 def _get_engines() -> tuple[AnalyzerEngine, AnonymizerEngine]:
-    """Create the Presidio engines on first use, as loading the models takes several seconds."""
+    """The Presidio engines, built on first use as loading the models takes several seconds."""
     global _ENGINES
     with _LOCK:
         if _ENGINES is None:
             _ENGINES = _build_engines()
-        return _ENGINES
+        engines = _ENGINES
+        _start_gliner_retry()
+    return engines
+
+
+def _start_gliner_retry() -> None:
+    """Load the GLiNER model in the background if a failed load is due. Called with ``_LOCK`` held."""
+    global _GLINER_RETRY_RUNNING
+    if _NEXT_GLINER_ATTEMPT is None or _GLINER_RETRY_RUNNING or time.monotonic() < _NEXT_GLINER_ATTEMPT[0]:
+        return
+    _GLINER_RETRY_RUNNING = True
+    threading.Thread(target=_retry_gliner, args=(_ENGINES,), daemon=True).start()
+
+
+def _retry_gliner(fallback: tuple[AnalyzerEngine, AnonymizerEngine]) -> None:
+    """Load the GLiNER model while requests keep using the fallback, then replace it in one step."""
+    global _NEXT_GLINER_ATTEMPT, _ENGINE_STATE, _GLINER_RETRY_RUNNING, _ENGINES
+    fallback_analyzer, anonymizer_engine = fallback
+    languages = fallback_analyzer.supported_languages
+    try:
+        recognizers = _build_gliner_recognizers(languages)
+        # A new analyzer over the loaded spaCy models: a request that already holds the fallback
+        # analyzer finishes with it, and no recognizer is removed from an analyzer in use.
+        registry = RecognizerRegistry(
+            recognizers=[r for r in fallback_analyzer.registry.recognizers if r.name != "SpacyRecognizer"] + recognizers,
+            supported_languages=languages,
+        )
+        analyzer = AnalyzerEngine(nlp_engine=fallback_analyzer.nlp_engine, registry=registry, supported_languages=languages)
+    except Exception as error:
+        LOGGER.warning(
+            "The GLiNER model %s could not be loaded, using the spaCy detection engine",
+            GLINER_MODEL,
+            exc_info=True,
+        )
+        with _LOCK:
+            _schedule_gliner_retry(error)
+    else:
+        LOGGER.info("The GLiNER model %s is loaded, using the GLiNER detection engine", GLINER_MODEL)
+        with _LOCK:
+            _ENGINES = (analyzer, anonymizer_engine)
+            _NEXT_GLINER_ATTEMPT = None
+            _ENGINE_STATE = (ENGINE_GLINER, None)
+    finally:
+        with _LOCK:
+            _GLINER_RETRY_RUNNING = False
+
+
+def engine_state() -> tuple[str, str | None]:
+    """The engine in use and, while GLiNER could not be loaded, the error of its first failed load."""
+    return _ENGINE_STATE
 
 
 def _resolve_language(language: str, supported: list[str]) -> str:

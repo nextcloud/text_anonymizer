@@ -10,6 +10,8 @@ installed, and they pin the engine to spaCy so that no network access happens ei
 """
 
 import logging
+import threading
+import time
 
 import anonymizer
 import pytest
@@ -99,16 +101,21 @@ def make_fake_gliner(spans_by_language, load_error=None):
     return FakeGlinerRecognizer
 
 
+def fake_models(monkeypatch, german_model=False):
+    """Replace the spaCy models by FakeNlpEngine; with ``german_model`` the German pipeline exists."""
+    monkeypatch.setattr(anonymizer, "NlpEngineProvider", FakeNlpEngineProvider)
+    monkeypatch.setattr(
+        anonymizer, "is_package", lambda model: german_model and model == anonymizer.LANGUAGE_MODELS["de"]
+    )
+
+
 def build_engines(monkeypatch, *, german_model=False, gliner=None):
     """Build the engines through the production path, with faked model loading.
 
     The returned analyzer is also cached as the module engines, so that detect_pii and
     redact_text use it directly.
     """
-    monkeypatch.setattr(anonymizer, "NlpEngineProvider", FakeNlpEngineProvider)
-    monkeypatch.setattr(
-        anonymizer, "is_package", lambda model: german_model and model == anonymizer.LANGUAGE_MODELS["de"]
-    )
+    fake_models(monkeypatch, german_model)
     if gliner is not None:
         monkeypatch.setattr(anonymizer, "GLiNERRecognizer", gliner)
     engines = anonymizer._get_engines()
@@ -116,14 +123,21 @@ def build_engines(monkeypatch, *, german_model=False, gliner=None):
     return engines
 
 
+def reset_engine_state():
+    anonymizer._ENGINES = None
+    anonymizer._ENGINE_STATE = (anonymizer.ENGINE_SPACY, None)
+    anonymizer._NEXT_GLINER_ATTEMPT = None
+    anonymizer._GLINER_RETRY_RUNNING = False
+
+
 @pytest.fixture(autouse=True)
 def isolated_engines(monkeypatch):
-    """Reset the engine cache and the engine selection around every test."""
-    anonymizer._ENGINES = None
+    """Reset the engine cache, the engine selection and the retry state around every test."""
+    reset_engine_state()
     FakeNlpEngineProvider.last_configuration = None
     monkeypatch.delenv(anonymizer.ENGINE_ENV_VAR, raising=False)
     yield
-    anonymizer._ENGINES = None
+    reset_engine_state()
 
 
 def recognizer_names(analyzer, language=None):
@@ -230,6 +244,113 @@ def test_gliner_model_download_failure_falls_back_to_spacy(monkeypatch):
     names = recognizer_names(analyzer)
     assert names.count("GLiNERRecognizer") == 0
     assert "SpacyRecognizer" in names
+
+
+def flaky_gliner(monkeypatch, permanent_error=None, on_success=None):
+    """Make the real GLiNERRecognizer fail its first download and succeed afterwards."""
+    from presidio_analyzer.predefined_recognizers.ner import gliner_recognizer
+
+    attempts = []
+
+    class FlakyGLiNER:
+        @staticmethod
+        def from_pretrained(model_name, **kwargs):
+            attempts.append(model_name)
+            if len(attempts) == 1:
+                raise permanent_error or OSError("the hub is unreachable")
+            if on_success is not None:
+                on_success()
+            return object()
+
+    monkeypatch.setattr(gliner_recognizer, "GLiNER", FlakyGLiNER)
+    monkeypatch.setattr(anonymizer, "GLINER_RETRY_DELAYS", (0, 0))
+    return attempts
+
+
+def wait_until(condition, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "the background retry did not finish"
+        time.sleep(0.01)
+
+
+def test_failed_gliner_load_is_retried_without_blocking_requests(monkeypatch):
+    """After a failed load the spaCy engine answers at once, and the model is loaded again later."""
+    fake_models(monkeypatch, german_model=True)
+    release = threading.Event()
+    attempts = flaky_gliner(monkeypatch, on_success=release.wait)
+    fallback_analyzer, _ = anonymizer._get_engines()
+
+    assert "SpacyRecognizer" in recognizer_names(fallback_analyzer)
+    assert anonymizer.engine_state() == (anonymizer.ENGINE_SPACY, "OSError: the hub is unreachable")
+
+    # The cooldown has passed: the request gets the fallback engines while the load is still running.
+    engines, _start = anonymizer._get_engines(), time.monotonic()
+    assert time.monotonic() - _start < 5
+    assert "SpacyRecognizer" in recognizer_names(engines[0])
+    release.set()
+    wait_until(lambda: anonymizer.engine_state()[0] == anonymizer.ENGINE_GLINER)
+
+    analyzer, _ = anonymizer._get_engines()
+    assert attempts == [anonymizer.GLINER_MODEL, anonymizer.GLINER_MODEL]
+    assert "GLiNERRecognizer" in recognizer_names(analyzer)
+    assert "SpacyRecognizer" not in recognizer_names(analyzer)
+    # The loaded spaCy models are kept, and German keeps its recognizers.
+    assert analyzer.nlp_engine is fallback_analyzer.nlp_engine
+    assert "DeTaxIdRecognizer" in recognizer_names(analyzer, language="de")
+    assert anonymizer.engine_state() == (anonymizer.ENGINE_GLINER, None)
+
+
+def test_gliner_retry_waits_for_the_cooldown(monkeypatch):
+    """A failed load is not retried on every request: the next attempt waits for the delay."""
+    fake_models(monkeypatch)
+    attempts = flaky_gliner(monkeypatch)
+    monkeypatch.setattr(anonymizer, "GLINER_RETRY_DELAYS", (3600,))
+    anonymizer._get_engines()
+    anonymizer._get_engines()
+
+    assert attempts == [anonymizer.GLINER_MODEL]
+    assert anonymizer._NEXT_GLINER_ATTEMPT is not None
+
+
+def test_missing_gliner_package_is_not_retried(monkeypatch):
+    """Without the gliner package no attempt can succeed, so none is made."""
+    fake_models(monkeypatch)
+    attempts = flaky_gliner(monkeypatch, permanent_error=ImportError("GLiNER is not installed"))
+    analyzer, _ = anonymizer._get_engines()
+    assert "SpacyRecognizer" in recognizer_names(analyzer)
+
+    anonymizer._get_engines()
+    time.sleep(0.1)
+
+    assert attempts == [anonymizer.GLINER_MODEL]
+    assert anonymizer._NEXT_GLINER_ATTEMPT is None
+
+
+def test_failing_retry_backs_off_and_keeps_the_first_error(monkeypatch):
+    """Every failed attempt waits longer, and the administrator sees the first error only."""
+    from presidio_analyzer.predefined_recognizers.ner import gliner_recognizer
+
+    fake_models(monkeypatch)
+    monkeypatch.setattr(anonymizer, "GLINER_RETRY_DELAYS", (60, 300, 1800))
+    clock = [1000.0]
+    monkeypatch.setattr(anonymizer.time, "monotonic", lambda: clock[0])
+    errors = iter([OSError("first failure"), OSError("second failure"), OSError("third failure")])
+
+    class FailingGLiNER:
+        @staticmethod
+        def from_pretrained(model_name, **kwargs):
+            raise next(errors)
+
+    monkeypatch.setattr(gliner_recognizer, "GLiNER", FailingGLiNER)
+    anonymizer._get_engines()
+    assert anonymizer.engine_state() == (anonymizer.ENGINE_SPACY, "OSError: first failure")
+
+    anonymizer._retry_gliner(anonymizer._ENGINES)
+    assert anonymizer._NEXT_GLINER_ATTEMPT == (1300.0, 1)
+    anonymizer._retry_gliner(anonymizer._ENGINES)
+    assert anonymizer._NEXT_GLINER_ATTEMPT == (2800.0, 2)
+    assert anonymizer.engine_state() == (anonymizer.ENGINE_SPACY, "OSError: first failure")
 
 
 def test_engine_env_var_selects_spacy(monkeypatch):
