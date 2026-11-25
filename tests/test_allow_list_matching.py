@@ -10,7 +10,7 @@ from presidio_analyzer import RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
 
 import anonymizer
-from config import Settings, filter_results, parse_allow_patterns
+from config import ENV_ALLOW_PATTERNS, Settings, filter_results, parse_allow_patterns
 
 LOGGER_NAME = "text_anonymizer.config"
 
@@ -144,3 +144,27 @@ def test_an_optional_group_no_longer_leaves_the_redacted_copy_unredacted(engines
     assert anonymizer.redact_text(text, settings=Settings(allow_patterns=(r"(Inc\.)?",))) == (
         "<PERSON> works at <ORGANIZATION> in <LOCATION>."
     )
+
+
+def test_an_alternation_on_one_line_behaves_like_several_patterns_longest_first():
+    """The admin form takes one line: several patterns go in as an alternation. The match of the pattern in the
+    text starts with the first alternative that fits, so a shorter one placed first hides the longer ones."""
+    text = "Contact Nextcloud GmbH today."
+    whole = _result("ORGANIZATION", text, "Nextcloud GmbH")
+    part = _result("ORGANIZATION", text, "Nextcloud")
+    tail = _result("ORGANIZATION", text, "GmbH")
+    assert filter_results([whole, part, tail], text, Settings(allow_patterns=("Nextcloud GmbH|Nextcloud",))) == []
+    assert filter_results([whole, part], text, Settings(allow_patterns=("Nextcloud|Nextcloud GmbH",))) == []
+    assert filter_results([tail], text, Settings(allow_patterns=("Nextcloud|Nextcloud GmbH",))) == [tail]
+
+
+def test_a_value_saved_with_an_alternation_is_one_pattern():
+    from config import apply_admin_config
+
+    layered = apply_admin_config(Settings(), {ENV_ALLOW_PATTERNS: "Nextcloud GmbH|Acme Corp"})
+    assert layered.allow_patterns == ("Nextcloud GmbH|Acme Corp",)
+
+
+def test_line_breaks_are_still_separators_for_the_environment_variable():
+    sources = tuple(source for source, _ in parse_allow_patterns("Nextcloud GmbH\nAcme Corp\n"))
+    assert sources == ("Nextcloud GmbH", "Acme Corp")

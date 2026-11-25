@@ -29,6 +29,7 @@ from config import (
     parse_allow_patterns,
     parse_ignored_entity_types,
 )
+from nc_py_api.ex_app.ui.settings import SettingsFieldType
 
 #: One value per knob per precedence level; the admin value beats env, env beats default.
 ENV_LEVEL = {
@@ -239,8 +240,6 @@ def test_admin_form_fields_are_the_appconfig_keys_with_builtin_defaults() -> Non
 
 
 def test_admin_form_threshold_field_is_a_number() -> None:
-    from nc_py_api.ex_app.ui.settings import SettingsFieldType
-
     threshold_field = next(f for f in _form().fields if f.id == ENV_SCORE_THRESHOLD)
     assert threshold_field.type == SettingsFieldType.NUMBER
     text_fields = [f for f in _form().fields if f.id in (ENV_IGNORED_ENTITY_TYPES, ENV_ALLOW_PATTERNS)]
@@ -328,3 +327,28 @@ def test_readme_documents_every_admin_setting() -> None:
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     for key in ADMIN_CONFIG_KEYS:
         assert key in readme, key
+
+
+def test_admin_form_takes_several_patterns_as_one_alternation_on_its_single_line() -> None:
+    """The field is a single-line input (AppAPI has no multi-line type), so it cannot take one pattern per line."""
+    from main import admin_settings_form
+
+    field = next(f for f in admin_settings_form().fields if f.id == ENV_ALLOW_PATTERNS)
+    assert field.type == SettingsFieldType.TEXT
+    assert field.placeholder == "Nextcloud GmbH|Acme Corp"
+    assert "one per line" not in field.description
+    assert "join several patterns with |" in field.description
+    assert "longest first" in field.description
+
+
+def test_readme_and_info_xml_tell_how_the_single_line_form_and_the_variable_take_several_patterns() -> None:
+    root = Path(__file__).resolve().parents[1]
+    # The README wraps its lines: one space instead of any run of white space, and without the code quotes.
+    readme = " ".join((root / "README.md").read_text(encoding="utf-8").replace("`", "").split())
+    info = ET.parse(root / "appinfo" / "info.xml").getroot().find("external-app").find("environment-variables")
+    description = next(v.findtext("description") for v in info.findall("variable") if v.findtext("name") == ENV_ALLOW_PATTERNS)
+    for text in (readme, description):
+        assert "one per line" in text
+        assert "joined with |" in text
+    assert "the admin form takes a single line" in readme
+    assert "the admin form takes one line" in description
