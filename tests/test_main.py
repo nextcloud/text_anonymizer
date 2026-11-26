@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import main
 import pytest
+from config import ENV_ALLOW_PATTERNS
 from nc_py_api import NextcloudException
 from nc_py_api.files import ActionFileInfo
 
@@ -180,8 +182,13 @@ def test_wait_for_trigger(events):
     asyncio.run(run())
 
 
-def make_async_nc():
+def make_async_nc(admin_settings=None):
+    """Return a mocked ``AsyncNextcloudApp`` whose admin settings read answers ``admin_settings``
+    ({key: value}; nothing saved by default)."""
     nc = MagicMock()
+    nc.appconfig_ex.get_values = AsyncMock(
+        return_value=[SimpleNamespace(key=key, value=value) for key, value in (admin_settings or {}).items()]
+    )
     nc.providers.task_processing.set_progress = AsyncMock()
     nc.providers.task_processing.report_result = AsyncMock()
     nc.providers.task_processing.next_task = AsyncMock()
@@ -190,23 +197,28 @@ def make_async_nc():
 
 
 def test_process_task_reports_output_and_progress(monkeypatch):
-    def handler(text, on_progress):
+    seen = []
+
+    def handler(text, on_progress, settings):
+        seen.append(settings)
         on_progress(50.0)
         on_progress(100.0)
         return text.upper()
 
     monkeypatch.setitem(main.TASK_HANDLERS, "text_anonymizer:redact_pii", handler)
-    nc = make_async_nc()
+    nc = make_async_nc({ENV_ALLOW_PATTERNS: "Admin Corp"})
     task = {"id": 7, "type": "text_anonymizer:redact_pii", "input": {"input": "hello"}}
 
     asyncio.run(main.process_task(nc, task))
 
     assert [call.args for call in nc.providers.task_processing.set_progress.await_args_list] == [(7, 50.0), (7, 100.0)]
     nc.providers.task_processing.report_result.assert_awaited_once_with(7, {"output": "HELLO"})
+    # the handler runs with the settings resolved for the task: the admin values over the environment
+    assert [resolved.allow_patterns for resolved in seen] == [("Admin Corp",)]
 
 
 def test_process_task_reports_error(monkeypatch):
-    def handler(text, on_progress):
+    def handler(text, on_progress, settings):
         raise ValueError("bad input")
 
     monkeypatch.setitem(main.TASK_HANDLERS, "text_anonymizer:detect_pii", handler)
