@@ -49,22 +49,39 @@ LOGGER = logging.getLogger(__name__)
 LOG_QUEUE_SIZE = 200
 # How long the shutdown waits for lines that are not sent yet.
 LOG_FLUSH_SECONDS = 2.0
+# The level Nextcloud logs at, indexed by the loglevel AppAPI publishes in its capabilities: 0 debug, 1 info,
+# 2 warning, 3 error.
+LOG_LEVELS = (logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR)
 
 
 class _LogQueueHandler(logging.handlers.QueueHandler):
     """Puts the lines of the app's loggers on the queue of the sending thread."""
 
     def enqueue(self, record: logging.LogRecord) -> None:
-        # The queue fills only while Nextcloud does not answer, when nothing could be delivered anyway.
+        # The queue fills when lines come faster than the sender sends them: while Nextcloud does not answer, or
+        # when one folder listing names hundreds of files.
         with suppress(queue.Full):
             self.queue.put_nowait(record)
 
 
-def configure_logging() -> logging.handlers.QueueListener:
-    """Send what the app's own loggers log at INFO and above to nextcloud.log.
+def log_at_nextcloud_level(nc: NextcloudApp) -> None:
+    """Log at the level Nextcloud logs at, which AppAPI publishes in the capabilities of a logged-in user.
 
-    Only the app's loggers feed the queue. Libraries log one INFO line per request or per redaction, and
-    each line sent would be one more request to Nextcloud, which drops INFO at its default loglevel anyway.
+    The level stays where it is when the capabilities do not carry the loglevel.
+    """
+    with suppress(KeyError, IndexError, TypeError, ValueError):
+        level = LOG_LEVELS[int(nc.capabilities["app_api"]["loglevel"])]
+        for logger in (LOGGER, BATCH_LOGGER):
+            logger.setLevel(level)
+
+
+def configure_logging() -> logging.handlers.QueueListener:
+    """Send what the app's own loggers log to nextcloud.log.
+
+    Every line sent is one request to Nextcloud, whatever its level; Nextcloud drops a line below its loglevel
+    after it was sent. So the app logs at that level, which each Files action reads (see
+    ``log_at_nextcloud_level``): the progress of a folder run is DEBUG and reaches nextcloud.log only while
+    Nextcloud logs debug. Libraries log one INFO line per request or per redaction and are not sent at all.
     """
     log_queue: queue.Queue[logging.LogRecord] = queue.Queue(LOG_QUEUE_SIZE)
     for logger in (LOGGER, BATCH_LOGGER):
@@ -263,7 +280,8 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
 
 
 def _log_batch_progress(index: int, total: int, name: str) -> None:
-    LOGGER.info("Redacting %s (%d of %d)", name, index, total)
+    # One line per file would be one request per file: DEBUG, so that it is sent only while Nextcloud logs debug.
+    LOGGER.debug("Redacting %s (%d of %d)", name, index, total)
 
 
 def redact_folder_action(nc: NextcloudApp, dir_info: ActionFileInfo) -> None:
@@ -335,6 +353,7 @@ def _run_once_per_node(user_id: str, file_id: int, action: Callable[[], None]) -
 def redact_files(user_id: str, files: list[ActionFileInfo]) -> None:
     nc = NextcloudApp()
     nc.set_user(user_id)
+    log_at_nextcloud_level(nc)  # the capabilities of the user are fetched by set_user; this costs no request
     for file_info in files:
         # AppAPI's Files payload reports directories as "folder" (current files plugin)
         # or "dir" (older payloads); both dispatch to the folder action.

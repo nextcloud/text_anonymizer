@@ -216,6 +216,8 @@ class FakeNc:
         self.appconfig_ex = FakeAppConfig()
         self.logs: list[tuple[int, str]] = []
         self.user_id = ""
+        #: The capabilities Nextcloud answers a logged-in user, as the app's session fetches them on ``set_user``.
+        self.capabilities = {"app_api": {"loglevel": 2}}
 
     def set_user(self, user_id: str) -> None:
         self.user_id = user_id
@@ -1146,15 +1148,18 @@ def test_single_file_action_is_a_no_op_when_the_copy_is_fresh(monkeypatch):
 
 
 @contextlib.contextmanager
-def logging_to(posted: list, stall: float = 0.0, gate: threading.Event | None = None):
+def logging_to(posted: list, stall: float = 0.0, gate: threading.Event | None = None, loglevel: int = 2):
     """Run ``configure_logging`` with what it would post to Nextcloud collected in ``posted`` instead.
 
     Each post is ``(thread id, level, message)`` and takes ``stall`` seconds. With a ``gate`` that is not set,
-    every post waits for it, as it does for a Nextcloud that hangs. The loggers are restored and the sender
-    stopped at the end.
+    every post waits for it, as it does for a Nextcloud that hangs. ``loglevel`` is the loglevel AppAPI publishes
+    for Nextcloud (2 is its default). The loggers are restored and the sender stopped at the end.
     """
 
     class Nextcloud:
+        def __init__(self):
+            self.capabilities = {"app_api": {"loglevel": loglevel}}
+
         def log(self, level, message, fast_send=False):
             posted.append((threading.get_ident(), level, message))
             time.sleep(stall)
@@ -1168,6 +1173,7 @@ def logging_to(posted: list, stall: float = 0.0, gate: threading.Event | None = 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("nc_py_api.ex_app.logger.NextcloudApp", lambda: Nextcloud())
         listener = main.configure_logging()
+        main.log_at_nextcloud_level(SimpleNamespace(capabilities=Nextcloud().capabilities))
         try:
             yield
         finally:
@@ -1186,10 +1192,8 @@ def test_only_the_app_loggers_reach_nextcloud():
         logging.getLogger("httpx").info('HTTP Request: GET https://nextcloud/ocs/v2.php/tasks_provider/next "HTTP/1.1 204"')
         logging.getLogger("presidio_analyzer.analyzer_engine").warning("Recognizer not added to registry")
         logging.getLogger("niquests").error("Connection failed")
-        batch.LOGGER.info("Redacting alpha.txt (1 of 4)")
         main.LOGGER.warning("Not redacting docs/: no file can be created in this folder")
     assert [(level, message) for _thread, level, message in posted] == [
-        (LogLvl.INFO, "Redacting alpha.txt (1 of 4)"),
         (LogLvl.WARNING, "Not redacting docs/: no file can be created in this folder"),
     ]
     # The root logger is left alone: it neither carries a handler to Nextcloud nor passes INFO.
@@ -1198,21 +1202,68 @@ def test_only_the_app_loggers_reach_nextcloud():
     assert root.level == logging.WARNING
 
 
-def test_a_library_logger_lowered_to_info_does_not_reach_nextcloud():
+def test_nothing_below_the_level_nextcloud_logs_at_is_sent(caplog):
+    """Every line sent is one request, whatever its level, and Nextcloud drops a line below its loglevel after it."""
+    posted = []
+    with logging_to(posted, loglevel=2):
+        main._log_batch_progress(3, 300, "c.txt")
+        batch.LOGGER.info("Skipped docs/a.txt: a line at INFO")
+        batch.LOGGER.warning("Skipped docs/huge.txt: larger than 10.0 MB")
+    assert [(level, message) for _thread, level, message in posted] == [
+        (LogLvl.WARNING, "Skipped docs/huge.txt: larger than 10.0 MB"),
+    ]
+    # The lower lines are not produced at all at this level, so no handler could send or show one.
+    assert "Redacting c.txt (3 of 300)" not in caplog.text
+    assert "a line at INFO" not in caplog.text
+    assert "Skipped docs/huge.txt: larger than 10.0 MB" in caplog.text
+
+
+def test_the_app_logs_at_each_level_nextcloud_logs_at():
+    posted = []
+    with logging_to(posted, loglevel=3):
+        batch.LOGGER.warning("Skipped docs/huge.txt: larger than 10.0 MB")
+        batch.LOGGER.error("Failed to redact docs/a.txt")
+    assert [level for _thread, level, _message in posted] == [LogLvl.ERROR]
+
+
+def test_the_progress_of_a_folder_run_is_debug_and_reaches_nextcloud_while_nextcloud_logs_debug():
+    """The progress stays available to an administrator who turns Nextcloud's loglevel to debug."""
+    posted = []
+    with logging_to(posted, loglevel=0):
+        main._log_batch_progress(3, 300, "c.txt")
+    assert [(level, message) for _thread, level, message in posted] == [(LogLvl.DEBUG, "Redacting c.txt (3 of 300)")]
+
+
+def test_an_action_logs_at_the_level_nextcloud_publishes_to_its_user(monkeypatch):
+    """AppAPI publishes the loglevel in the capabilities it answers a logged-in user, not to a session without one."""
+    nc = FakeNc()
+    node = nc.files.add_file("notes.txt", b"one", "text/plain")
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    monkeypatch.setattr(main, "redact_text", fake_redact)
+    with logging_to([]):
+        nc.capabilities = {"app_api": {"version": "35.0.0"}}  # as answered while no user is set, at the startup
+        main.redact_files("admin", [action_info(node, "file")])
+        assert (main.LOGGER.level, batch.LOGGER.level) == (logging.WARNING, logging.WARNING)
+        nc.capabilities = {"app_api": {"loglevel": 0}}
+        main.redact_files("admin", [action_info(node, "file")])
+        assert (main.LOGGER.level, batch.LOGGER.level) == (logging.DEBUG, logging.DEBUG)
+
+
+def test_a_folder_run_sends_its_warnings_and_nothing_per_file():
+    """Each line sent is one request, so a run sends its warnings and errors only: nothing for a file that goes well."""
+    nc, docs = build_folder_tree([(f"docs/{number:03d}.txt", b"one", "text/plain") for number in range(300)])
+    nc.files.add_file("docs/huge.txt", b"x" * 100, "text/plain")
+    nc.files.add_dir("docs/broken")
+    nc.files.unlistable.add("docs/broken")
     posted = []
     with logging_to(posted):
-        logging.getLogger("httpx").setLevel(logging.INFO)
-        logging.getLogger("httpx").info("HTTP Request: GET https://nextcloud/")
-    logging.getLogger("httpx").setLevel(logging.NOTSET)
-    assert posted == []
-
-
-def test_the_app_logs_at_info_and_caplog_still_sees_it(caplog):
-    """The batch progress lines are INFO and must pass, and tests keep reading them through the root handlers."""
-    with logging_to([]):
-        with caplog.at_level(logging.INFO):
-            batch.LOGGER.info("Redacting alpha.txt (1 of 4)")
-    assert "Redacting alpha.txt (1 of 4)" in caplog.text
+        report = redact_folder(nc, docs, redact=fake_redact, on_progress=main._log_batch_progress, max_bytes=50)
+    assert len(report.redacted) == 300 and len(report.skipped) == 1 and len(report.unreadable_folders) == 1
+    not_listed = "Skipped docs/broken/: the folder could not be listed ([503] Storage is temporarily unavailable)"
+    assert [(level, message) for _thread, level, message in posted] == [
+        (LogLvl.WARNING, "Skipped docs/huge.txt: larger than 50 bytes"),
+        (LogLvl.WARNING, not_listed),
+    ]
 
 
 def test_no_line_is_posted_from_the_event_loops_thread():
@@ -1261,12 +1312,12 @@ def test_the_traceback_of_a_failure_reaches_nextcloud():
 
 
 def test_a_full_queue_drops_new_lines_without_an_error(capsys):
-    """The queue fills only while Nextcloud does not answer; a line more must not raise or block."""
+    """The queue fills while Nextcloud does not answer or when lines come in a burst; a line more must not block."""
     posted = []
     gate = threading.Event()
     with logging_to(posted, gate=gate):
         for number in range(main.LOG_QUEUE_SIZE + 10):
-            batch.LOGGER.info("Redacting f%d.txt", number)
+            batch.LOGGER.warning("Skipped f%d.txt: too large", number)
         gate.set()
     assert main.LOG_QUEUE_SIZE <= len(posted) <= main.LOG_QUEUE_SIZE + 1
     assert "Logging error" not in capsys.readouterr().err
@@ -1278,7 +1329,7 @@ def test_the_shutdown_does_not_wait_for_a_hanging_request():
     gate = threading.Event()
     clock = time.monotonic()
     with logging_to(posted, gate=gate):
-        batch.LOGGER.info("Redacting a.txt (1 of 1)")
+        batch.LOGGER.warning("Skipped a.txt: too large")
         # The sending thread has taken the line and now waits for its answer.
         deadline = time.monotonic() + 5
         while not posted and time.monotonic() < deadline:
