@@ -54,8 +54,11 @@ overlap partly is refused: Presidio then reports offsets that do not address the
 
 Entity types follow Presidio's names (`PERSON`, `EMAIL_ADDRESS`, `PHONE_NUMBER`,
 `LOCATION`, `CREDIT_CARD`, `IBAN_CODE`, `US_SSN`, `URL`, `IP_ADDRESS`, `DATE_TIME`).
-The runner validates every line at load time and refuses to run on malformed,
-out-of-range or overlapping annotations.
+The runner validates every line at load time and refuses to run, with
+`error: <file>:<line>: ...` and exit code 2, on a record whose fields have the wrong
+types (a string or null offset, a text that is not a string), a span out of range or
+overlapping another, or a span whose `text` is not the slice between its offsets. The
+`text` of an entity is optional: only a span that names it is checked against it.
 
 ## Annotation policy
 
@@ -65,7 +68,9 @@ false-positive traps:
 - Only explicit calendar dates are annotated as `DATE_TIME` ("March 3, 2025"), not
   weekday or vague temporal phrases ("Friday", "the weekend").
 - A full address is one `LOCATION` span, even when the detector splits it into
-  street and city; the partial-match table credits such boundary drift.
+  street and city. Both matchings are one-to-one, so a split address scores one
+  true positive and one false positive: the partial matching recovers the recall,
+  not the precision.
 - Organization and product names are not annotated: public company names are not
   personal data ("Nextcloud GmbH and Apple Inc. announced ...").
 - Long digit strings that fail the Luhn check are not annotated (a 16-digit order
@@ -76,6 +81,6 @@ false-positive traps:
   123-45-6789 is deliberately not used: Presidio's recognizer rejects it as a known
   example value.
 
-Adding samples: append lines to `dataset.jsonl` keeping spans exact (the load-time
-validation will catch mistakes), or regenerate the file and keep it reviewed like
-any other source.
+Adding samples: append lines to `dataset.jsonl`, keeping the offsets exact and naming
+each span's `text` (the load-time validation refuses a span that does not slice to
+it), or regenerate the file and keep it reviewed like any other source.

@@ -42,8 +42,8 @@ sys.path.insert(0, str(REPO_ROOT / "ex_app" / "lib"))
 
 # The public detect/redact API returns text without offsets, but a span-based benchmark needs the
 # entities of the app's own pipeline, analysis and overlap resolution included, as spans.
-from anonymizer import _analyze, _get_engines, _resolve_overlaps  # noqa: E402
-from config import Settings, filter_results, parse_allow_patterns, parse_ignored_entity_types  # noqa: E402
+from anonymizer import _analyze, _apply_settings, _get_engines, _resolve_overlaps  # noqa: E402
+from config import Settings, parse_allow_patterns, parse_ignored_entity_types  # noqa: E402
 
 DEFAULT_DATASET = Path(__file__).resolve().parent / "dataset.jsonl"
 OVERALL = "OVERALL"
@@ -82,8 +82,8 @@ class Counts:
 def load_dataset(path: Path) -> list[Sample]:
     """Load and validate a JSONL dataset, raising ``ValueError`` on any malformed record.
 
-    Validation catches annotation rot at benchmark time: spans must be in range, ground-truth
-    spans must not overlap, and each annotated span must be present exactly once.
+    Validation catches annotation rot at benchmark time: every field must have its type, spans must be
+    in range and must not overlap, and a span must slice to the text it annotates.
     """
     samples = []
     with path.open(encoding="utf-8") as fp:
@@ -92,21 +92,56 @@ def load_dataset(path: Path) -> list[Sample]:
                 continue
             try:
                 record = json.loads(line)
-                text = record["text"]
-                entities = [Entity(type=e["type"], start=e["start"], end=e["end"]) for e in record["entities"]]
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
+            except json.JSONDecodeError as e:
                 raise ValueError(f"{path}:{line_no}: malformed record: {e}") from e
-            previous_end = -1
-            for entity in sorted(entities, key=lambda e: e.start):
-                if not 0 <= entity.start < entity.end <= len(text):
-                    raise ValueError(f"{path}:{line_no}: span {entity} out of range (length {len(text)})")
-                if entity.start < previous_end:
-                    raise ValueError(f"{path}:{line_no}: overlapping ground-truth spans at {entity.start}")
-                previous_end = entity.end
-            samples.append(Sample(text=text, truth=tuple(sorted(entities, key=lambda e: e.start))))
+            samples.append(_load_sample(record, f"{path}:{line_no}"))
     if not samples:
         raise ValueError(f"{path}: no records found")
     return samples
+
+
+def _load_sample(record: object, where: str) -> Sample:
+    """One dataset record as a :class:`Sample`; a malformed one raises ``ValueError`` naming ``where``."""
+    try:
+        text, raw_entities = record["text"], record["entities"]
+    except (KeyError, TypeError) as e:
+        raise ValueError(f"{where}: malformed record: {e}") from e
+    if not isinstance(text, str):
+        raise ValueError(f"{where}: text must be a string, not {type(text).__name__}")
+    if not isinstance(raw_entities, list):
+        raise ValueError(f"{where}: entities must be a list, not {type(raw_entities).__name__}")
+    entities = [
+        _load_entity(entity, text, f"{where}: entity {index}") for index, entity in enumerate(raw_entities)
+    ]
+    previous_end = -1
+    for entity in sorted(entities, key=lambda e: e.start):
+        if entity.start < previous_end:
+            raise ValueError(f"{where}: overlapping ground-truth spans at {entity.start}")
+        previous_end = entity.end
+    return Sample(text=text, truth=tuple(sorted(entities, key=lambda e: e.start)))
+
+
+def _load_entity(entity: object, text: str, where: str) -> Entity:
+    """One annotated entity of a record, checked against ``text``: its type is a non-empty string, its offsets
+    are integers inside ``text``, and the slice between them is the ``text`` the entity names, if it names one."""
+    if not isinstance(entity, dict):
+        raise ValueError(f"{where}: must be an object, not {type(entity).__name__}")
+    try:
+        entity_type, start, end = entity["type"], entity["start"], entity["end"]
+    except KeyError as e:
+        raise ValueError(f"{where}: missing {e}") from e
+    if not isinstance(entity_type, str) or not entity_type:
+        raise ValueError(f"{where}: type must be a non-empty string, not {entity_type!r}")
+    if not all(isinstance(offset, int) and not isinstance(offset, bool) for offset in (start, end)):
+        raise ValueError(f"{where}: start and end must be integers, not {start!r} and {end!r}")
+    if not 0 <= start < end <= len(text):
+        raise ValueError(f"{where}: span {entity_type} {start}-{end} out of range (length {len(text)})")
+    annotated = entity.get("text")
+    if annotated is not None and text[start:end] != annotated:
+        raise ValueError(
+            f"{where}: span {entity_type} {start}-{end} is {text[start:end]!r}, not its annotated text {annotated!r}"
+        )
+    return Entity(type=entity_type, start=start, end=end)
 
 
 def _located_items(anonymizer: AnonymizerEngine, text: str, results: list[RecognizerResult]) -> list[OperatorResult]:
@@ -133,9 +168,7 @@ def detect(text: str, settings: Settings) -> list[Entity]:
     that order, so the entities returned are the ones the app reports and redacts.
     """
     analyzer, anonymizer = _get_engines()
-    results = _analyze(analyzer, text, "en", None)
-    if settings != Settings():
-        results = filter_results(results, text, settings)
+    results = _apply_settings(_analyze(analyzer, text, "en", None), text, settings)
     items = _located_items(anonymizer, text, results)
     return [Entity(type=item.entity_type, start=item.start, end=item.end, score=item.score) for item in items]
 
@@ -214,35 +247,54 @@ def accumulate(
 ) -> None:
     """Update the per-type and overall counts; on the exact pass, record mismatch examples.
 
-    Examples are capped per entity type and category; the exact pass is the one that feeds
-    them because partial-match mismatches are dominated by boundary drift.
+    Every detection is either matched or spurious, a duplicate of a matched span included. Examples
+    are capped per entity type and category; the exact pass is the one that feeds them because
+    partial-match mismatches are dominated by boundary drift.
     """
     matched, missed = matcher(detected, list(truth))
-    matched_keys = {(e.type, e.start, e.end) for e in matched}
-    spurious = [e for e in detected if (e.type, e.start, e.end) not in matched_keys]
+    # The matchers return the detections they consume, so the detections left over are the spurious ones.
+    spurious = list((Counter(detected) - Counter(matched)).elements())
     for entity_type in {e.type for e in detected} | {e.type for e in truth}:
         counts = table.setdefault(entity_type, Counts())
+        matched_here = [e for e in matched if e.type == entity_type]
+        missed_here = [e for e in missed if e.type == entity_type]
+        spurious_here = [e for e in spurious if e.type == entity_type]
+        if matcher is match_exact:
+            # The cap counts what earlier samples recorded; what is left of it is this sample's room.
+            _record_examples(
+                examples, "missed (FN)", entity_type, sample.text, missed_here, room=example_limit - counts.fn
+            )
+            _record_examples(
+                examples, "spurious (FP)", entity_type, sample.text, spurious_here, room=example_limit - counts.fp
+            )
         counts.truth += sum(1 for e in truth if e.type == entity_type)
         counts.detected += sum(1 for e in detected if e.type == entity_type)
-        counts.tp += sum(1 for e in matched if e.type == entity_type)
-        counts.fp += sum(1 for e in spurious if e.type == entity_type)
-        counts.fn += sum(1 for e in missed if e.type == entity_type)
-        if matcher is match_exact and counts.fn <= example_limit:
-            examples["missed (FN)"].setdefault(entity_type, []).extend(
-                _context(sample.text, e) for e in missed if e.type == entity_type
-            )
-        if matcher is match_exact and counts.fp <= example_limit:
-            examples["spurious (FP)"].setdefault(entity_type, []).extend(
-                _context(sample.text, e) + (f" (score {e.score:.2f})" if e.score is not None else "")
-                for e in spurious
-                if e.type == entity_type
-            )
+        counts.tp += len(matched_here)
+        counts.fp += len(spurious_here)
+        counts.fn += len(missed_here)
     overall = table.setdefault(OVERALL, Counts())
     overall.truth += len(truth)
     overall.detected += len(detected)
     overall.tp += len(matched)
     overall.fp += len(spurious)
     overall.fn += len(missed)
+
+
+def _record_examples(
+    examples: dict[str, dict[str, list[str]]],
+    category: str,
+    entity_type: str,
+    text: str,
+    entities: list[Entity],
+    *,
+    room: int,
+) -> None:
+    """Add the first ``room`` of ``entities`` to the ``category`` examples of ``entity_type``, each in its
+    context and with its score when it has one; nothing when ``room`` is not positive."""
+    if room > 0:
+        examples[category].setdefault(entity_type, []).extend(
+            _context(text, e) + (f" (score {e.score:.2f})" if e.score is not None else "") for e in entities[:room]
+        )
 
 
 def _context(text: str, entity: Entity, width: int = 24) -> str:
@@ -327,7 +379,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Command line surface; every flag is optional so a bare ``python evals/run.py`` works."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET, help="JSONL dataset path")
-    parser.add_argument("--threshold", type=float, default=None, help="confidence threshold; no score threshold applies until one is given (the settings form suggests 0.5)")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="confidence threshold; no score threshold applies until one is given (the settings form suggests 0.5)",
+    )
     parser.add_argument("--ignore", default=None, help="comma-separated entity types to ignore, e.g. URL,DATE")
     parser.add_argument("--allow", default=None, help="newline-separated regex; matches are never redacted")
     parser.add_argument("--examples", type=int, default=3, help="mismatch examples per type (default 3)")
@@ -368,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         print("== Mismatch examples (exact match) ==")
         for category, per_type in result["examples"].items():
             for entity_type, entries in sorted(per_type.items()):
-                for entry in entries[: args.examples]:
+                for entry in entries:
                     print(f"  {category} {entity_type}: {entry}")
     if args.json:
         dump_json(args.json, args.dataset, samples, settings, result)
