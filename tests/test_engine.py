@@ -16,6 +16,7 @@ import time
 import anonymizer
 import pytest
 from presidio_analyzer import RecognizerResult
+from presidio_analyzer.nlp_engine import NlpEngineProvider
 from spacy.util import is_package
 
 ENGLISH_TEXT = "John Smith called from +1-415-555-0192."
@@ -49,13 +50,14 @@ class FakeNlpEngine:
         return None
 
 
-class FakeNlpEngineProvider:
-    """Stand-in for NlpEngineProvider that records the configuration it was given."""
+class FakeNlpEngineProvider(NlpEngineProvider):
+    """Stand-in for NlpEngineProvider that records the configuration it is given and loads no model.
+
+    Its constructor is Presidio's own, so that the configuration is validated and Presidio's default
+    configuration is read as in production; only ``create_engine`` is replaced.
+    """
 
     last_configuration = None
-
-    def __init__(self, nlp_configuration=None):
-        self.nlp_configuration = nlp_configuration
 
     def create_engine(self):
         FakeNlpEngineProvider.last_configuration = self.nlp_configuration
@@ -529,6 +531,30 @@ def test_nlp_configuration_covers_installed_languages(monkeypatch):
     ]
 
 
+def test_nlp_configuration_keeps_presidio_default_ner_settings(monkeypatch):
+    """The spaCy engine keeps the NER settings of ``AnalyzerEngine()``: Presidio's defaults, and MISC ignored.
+
+    Without them the labels Presidio ignores for their false positives (ORGANIZATION, CARDINAL, MONEY, ...)
+    come through, FAC is no longer a LOCATION, and each unmapped label logs a warning.
+    """
+    build_engines(monkeypatch, german_model=True)
+    ner = FakeNlpEngineProvider.last_configuration["ner_model_configuration"]
+    defaults = NlpEngineProvider().nlp_configuration["ner_model_configuration"]
+
+    assert ner["model_to_presidio_entity_mapping"]["FAC"] == "LOCATION"
+    assert {"ORGANIZATION", "CARDINAL", "MONEY", "EVENT"} <= set(ner["labels_to_ignore"])
+    # de_core_news_lg emits MISC for events, products and the like: a label without a Presidio type.
+    assert ner == {**defaults, "labels_to_ignore": [*defaults["labels_to_ignore"], "MISC"]}
+
+
+def test_gliner_engine_still_redacts_organizations(monkeypatch):
+    """The ignored spaCy label stays ignored: an organization the GLiNER model finds is redacted."""
+    fake_gliner = make_fake_gliner({"en": [("ORGANIZATION", "Apple", 0.9)]})
+    build_engines(monkeypatch, gliner=fake_gliner)
+
+    assert anonymizer.redact_text("I work for Apple.") == "I work for <ORGANIZATION>."
+
+
 def test_german_text_detects_german_pii(monkeypatch):
     """German analysis runs the DE_* recognizers: a valid Steuer-IdNr. is found and redacted."""
     fake_gliner = make_fake_gliner({"de": [("PERSON", "Anna Müller", 0.85)]})
@@ -597,3 +623,34 @@ def test_gliner_failure_falls_back_to_working_spacy_detection(monkeypatch):
 
     detected = anonymizer.detect_pii(ENGLISH_TEXT)
     assert "PERSON: John Smith" in detected
+
+
+AIRPORT_TEXT = "My name is John Smith and I work for Apple. Tomorrow I fly from Tegel airport to Paris."
+GERMAN_NATIONALITY_TEXT = "Anna Müller ist Deutsche und arbeitet bei Siemens in Berlin."
+
+
+@pytest.mark.spacy
+@pytest.mark.skipif(
+    not (ENGLISH_MODEL_INSTALLED and GERMAN_MODEL_INSTALLED),
+    reason="the English and German spaCy models are not installed",
+)
+def test_spacy_engine_keeps_presidio_default_ner_settings(monkeypatch, caplog):
+    """With the real models, the spaCy engine finds what ``AnalyzerEngine()`` found.
+
+    An airport is a location, an organization and a German MISC entity are left alone, and no label is
+    reported as unmapped, in either language.
+    """
+    monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, anonymizer.ENGINE_SPACY)
+    with caplog.at_level(logging.WARNING, logger="presidio-analyzer"):
+        english = anonymizer.redact_text(AIRPORT_TEXT)
+        german = anonymizer.redact_text(GERMAN_NATIONALITY_TEXT, language="de")
+
+    assert "Tegel" not in english
+    assert "<LOCATION> airport" in english
+    assert "Apple" in english
+    assert "<ORGANIZATION>" not in english
+    assert "<PERSON>" in german
+    assert "Deutsche" in german
+    assert "Siemens" in german
+    assert "<LOCATION>" in german
+    assert [message for message in caplog.messages if "is not mapped" in message] == []

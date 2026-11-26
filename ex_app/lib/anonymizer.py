@@ -263,16 +263,29 @@ def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
     return True
 
 
+def _nlp_configuration(languages: list[str]) -> dict:
+    """The configuration of the spaCy engine for ``languages``, built on Presidio's default one.
+
+    A configuration given to ``NlpEngineProvider`` takes the place of Presidio's ``default.yaml`` as a whole,
+    the file ``AnalyzerEngine()`` reads. Its NER settings are kept: the labels with many false positives are
+    ignored and the others are mapped to Presidio's types. MISC is ignored as well: ``de_core_news_lg`` emits it
+    for events, products, languages and the like, and it has no Presidio type.
+    """
+    configuration = NlpEngineProvider().nlp_configuration
+    configuration["models"] = [
+        {"lang_code": language, "model_name": LANGUAGE_MODELS[language]} for language in languages
+    ]
+    labels_to_ignore = configuration["ner_model_configuration"]["labels_to_ignore"]
+    if "MISC" not in labels_to_ignore:
+        labels_to_ignore.append("MISC")
+    return configuration
+
+
 def _build_engines() -> tuple[AnalyzerEngine, AnonymizerEngine]:
     """Create the analyzer and anonymizer with the recognizer set for every supported language."""
     global _ENGINE_STATE
     languages = _supported_languages()
-    nlp_engine = NlpEngineProvider(
-        nlp_configuration={
-            "nlp_engine_name": "spacy",
-            "models": [{"lang_code": language, "model_name": LANGUAGE_MODELS[language]} for language in languages],
-        }
-    ).create_engine()
+    nlp_engine = NlpEngineProvider(nlp_configuration=_nlp_configuration(languages)).create_engine()
     analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=languages)
     if "de" in languages:
         for recognizer in GERMAN_RECOGNIZERS:
