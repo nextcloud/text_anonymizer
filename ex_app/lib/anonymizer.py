@@ -3,6 +3,7 @@
 
 """PII detection and redaction using Presidio."""
 
+import re
 import threading
 from collections.abc import Callable, Iterator
 
@@ -118,19 +119,25 @@ def pseudonymize_text(
     value always resolves to the same placeholder. Returns the pseudonymized text and a mapping of each
     placeholder, e.g. ``<PERSON_1>``, to its original value, to be kept by the data controller for
     re-identification.
+
+    A placeholder the text already holds is never assigned, so no key of the mapping occurs in the input and
+    the original text is restored by replacing each key in the output by its value.
     """
     analyzer, anonymizer = _get_engines()
     results = _analyze(analyzer, text, language, on_progress)
-    # The keep pass resolves overlapping entities the same way as the replacement pass below, and its items
-    # carry the original values, so placeholders can be assigned before any text is replaced.
-    items = anonymizer.anonymize(text=text, analyzer_results=results, operators=_KEEP_OPERATORS).items
+    items = _resolve_overlaps(anonymizer, text, results)
+    # Every bracketed token of the text, so it holds each placeholder the text already has.
+    taken = set(re.findall(r"<[^<>]*>", text))
     placeholders: dict[tuple[str, str], str] = {}
     counters: dict[str, int] = {}
     for item in sorted(items, key=lambda item: item.start):
         key = (item.entity_type, item.text)
         if key not in placeholders:
-            counters[item.entity_type] = counters.get(item.entity_type, 0) + 1
-            placeholders[key] = f"<{item.entity_type}_{counters[item.entity_type]}>"
+            number = counters.get(item.entity_type, 0) + 1
+            while f"<{item.entity_type}_{number}>" in taken:
+                number += 1
+            counters[item.entity_type] = number
+            placeholders[key] = f"<{item.entity_type}_{number}>"
 
     def assign(entity_type: str) -> Callable[[str], str]:
         def replace(value: str) -> str:

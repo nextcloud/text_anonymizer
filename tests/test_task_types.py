@@ -258,6 +258,63 @@ def test_pseudonymize_mode_keys_are_the_placeholders_of_the_text(set_engines) ->
     assert restore(output["output"], mapping) == text
 
 
+def test_pseudonymize_mode_skips_a_placeholder_the_text_holds(set_engines) -> None:
+    text = "Template uses <PERSON_1>; contact Alice."
+    set_engines([entity("PERSON", "Alice", text)])
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+
+    assert output["output"] == "Template uses <PERSON_1>; contact <PERSON_2>."
+    assert json.loads(output["mapping"]) == {"<PERSON_2>": "Alice"}
+    assert restore(output["output"], json.loads(output["mapping"])) == text
+
+
+ONLY_ALICE = [("PERSON", "Alice")]
+
+
+@pytest.mark.parametrize(
+    ("text", "entities", "expected"),
+    [
+        # The numbering takes the numbers the text leaves free, whatever their length.
+        (
+            "Template uses <PERSON_1> and <PERSON_3>; contact Alice, Bob and Carol.",
+            [("PERSON", "Alice"), ("PERSON", "Bob"), ("PERSON", "Carol")],
+            {"<PERSON_2>": "Alice", "<PERSON_4>": "Bob", "<PERSON_5>": "Carol"},
+        ),
+        ("Contact <PERSON_999999999> or <PERSON_1000000000>. Alice knows.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        # A value that holds a placeholder of the text.
+        (
+            "Meet Alice and Bob <PERSON_1>.",
+            [("PERSON", "Alice"), ("LOCATION", "Bob <PERSON_1>")],
+            {"<PERSON_2>": "Alice", "<LOCATION_1>": "Bob <PERSON_1>"},
+        ),
+        # Other types and other spellings, which the task never writes.
+        ("Call <PHONE_NUMBER_1> now. This is Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        ("Template uses <FOO_1>; contact Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        ("Template uses <PERSON_01>; contact Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        ("Template uses [PERSON_1]; contact Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        ("Template uses <person_1>; contact Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+    ],
+)
+def test_pseudonymize_mode_restores_a_text_that_holds_placeholders(set_engines, text, entities, expected) -> None:
+    set_engines([entity(entity_type, value, text) for entity_type, value in entities])
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+    mapping = json.loads(output["mapping"])
+
+    assert mapping == expected
+    assert not any(placeholder in text for placeholder in mapping)
+    for keys in (list(mapping), list(reversed(mapping))):
+        assert restore(output["output"], {key: mapping[key] for key in keys}) == text
+
+
+def test_pseudonymize_mode_skips_fifty_thousand_placeholders(monkeypatch) -> None:
+    text = " ".join(f"<PERSON_{number}>" for number in range(1, 50_001)) + " Alice"
+    monkeypatch.setattr(anonymizer, "_get_engines", lambda: (ChunkAnalyzer(), AnonymizerEngine()))
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+
+    assert json.loads(output["mapping"]) == {"<PERSON_50001>": "Alice"}
+    assert restore(output["output"], json.loads(output["mapping"])) == text
+
+
 def test_pseudonymize_mode_reuses_placeholders_for_repeated_values(set_engines) -> None:
     text = "Bob met Alice. Bob left."
     set_engines(
@@ -283,6 +340,23 @@ def test_pseudonymize_mode_resolves_overlapping_entities(set_engines) -> None:
     output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
     assert output["output"] == "<PERSON_1>"
     assert json.loads(output["mapping"]) == {"<PERSON_1>": "John Smith"}
+
+
+def test_pseudonymize_mode_resolves_overlaps_with_the_shared_helper(monkeypatch, set_engines) -> None:
+    set_engines(TEXT_RESULTS)
+    resolve_overlaps = anonymizer._resolve_overlaps
+    resolved = []
+
+    def spy(anonymizer_engine, text, results):
+        items = resolve_overlaps(anonymizer_engine, text, results)
+        resolved.append([(item.entity_type, item.start, item.end) for item in items])
+        return items
+
+    monkeypatch.setattr(anonymizer, "_resolve_overlaps", spy)
+    main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT, "mode": "pseudonymize"})
+
+    assert len(resolved) == 1
+    assert sorted(resolved[0]) == [("EMAIL_ADDRESS", 17, 32), ("PERSON", 0, 5), ("PERSON", 10, 13)]
 
 
 def test_pseudonymize_mode_without_pii_reports_empty_mapping(set_engines) -> None:
