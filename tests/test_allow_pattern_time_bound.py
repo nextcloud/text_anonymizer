@@ -7,6 +7,7 @@ import inspect
 import logging
 import random
 import re
+import threading
 import time
 
 import pytest
@@ -21,6 +22,32 @@ LOGGER_NAME = "text_anonymizer.config"
 
 def _result(start, end, score=0.85):
     return RecognizerResult(entity_type="PERSON", start=start, end=end, score=score)
+
+
+def _text_with_detections(lines):
+    """``lines`` lines of "Anna Meyer grew up in Berlin.": a detection of "Anna Meyer", then one of "Berlin",
+    per line, so that ``results[0::2]`` are the ones a pattern Berlin does not keep."""
+    text = "Anna Meyer grew up in Berlin.\n" * lines
+    return text, [_result(match.start(), match.end()) for match in re.finditer("Anna Meyer|Berlin", text)]
+
+
+class Around:
+    """A pattern for ``_allow_listed`` that runs ``before(name)`` and then answers as the ``inner`` pattern."""
+
+    def __init__(self, inner, before):
+        self.inner = inner
+        self.before = before
+        self.calls = []
+
+    def finditer(self, text, timeout, concurrent):
+        self.calls.append("finditer")
+        self.before("finditer")
+        return self.inner.finditer(text, timeout=timeout, concurrent=concurrent)
+
+    def fullmatch(self, string, timeout, concurrent):
+        self.calls.append("fullmatch")
+        self.before("fullmatch")
+        return self.inner.fullmatch(string, timeout=timeout, concurrent=concurrent)
 
 
 @pytest.mark.parametrize(
@@ -40,29 +67,31 @@ def test_no_pattern_holds_the_worker(pattern, text):
     assert kept == [_result(0, len(text))]
 
 
-def test_a_pattern_that_runs_out_of_time_is_dropped_whole_with_one_warning(monkeypatch, caplog):
-    """No verdict of the pattern survives, and the pattern is warned about once per process."""
+def test_a_pattern_that_runs_out_of_time_is_dropped_whole_and_logged_every_time(monkeypatch, caplog):
+    """No verdict of the pattern survives, and every analysis that loses it says so: a skip that is logged
+    once per process leaves an administrator who reads the log later without a word about it."""
     monkeypatch.setattr(config, "ALLOW_PATTERN_TIME_BUDGET", 0.0)
     monkeypatch.setattr(config, "ALLOW_PATTERN_SECONDS_PER_CHARACTER", 0.0)
-    config._TIMED_OUT_PATTERNS.clear()
     text = "Anna Meyer works in Berlin."
     results = [_result(0, 10), _result(20, 26)]
     settings = Settings(allow_patterns=("Berlin",))
     with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
         for _ in range(2):
             assert filter_results(results, text, settings) == results
-    assert caplog.text.count("Berlin") == 1
-    assert "Ignoring allow-list pattern 'Berlin'" in caplog.text
+    assert caplog.text.count("Ignoring allow-list pattern 'Berlin'") == 2
+    assert "on a text of 27 characters with 2 detections" in caplog.text
+    assert "0.00 s" in caplog.text
+    assert "backtrack" not in caplog.text
 
 
-def test_a_sound_pattern_is_unaffected_by_the_budget():
+def test_a_sound_pattern_is_unaffected_by_the_budget(caplog):
     """The budget is never spent on a pattern that names what it keeps."""
-    config._TIMED_OUT_PATTERNS.clear()
     text = "Nextcloud GmbH employs Anna Meyer in Berlin."
     results = [_result(0, 14, 0.9), _result(23, 33), _result(37, 43)]
-    kept = filter_results(results, text, Settings(allow_patterns=("Berlin", "Nextcloud GmbH")))
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        kept = filter_results(results, text, Settings(allow_patterns=("Berlin", "Nextcloud GmbH")))
     assert kept == [results[1]]
-    assert config._TIMED_OUT_PATTERNS == set()
+    assert caplog.text == ""
 
 
 def test_the_patterns_run_under_an_engine_that_bounds_the_time():
@@ -137,11 +166,8 @@ def test_a_sound_pattern_gets_the_time_a_long_text_needs(monkeypatch):
     """A literal needs tens of milliseconds on a long text with many detections: with a budget that does not
     grow with the text it is skipped there and all the names it covers are redacted."""
     monkeypatch.setattr(config, "ALLOW_PATTERN_TIME_BUDGET", 0.0)
-    config._TIMED_OUT_PATTERNS.clear()
-    text = "Anna Meyer grew up in Berlin.\n" * 10_000
-    results = [_result(match.start(), match.end()) for match in re.finditer("Berlin", text)]
-    assert filter_results(results, text, Settings(allow_patterns=("Berlin",))) == []
-    assert config._TIMED_OUT_PATTERNS == set()
+    text, results = _text_with_detections(10_000)
+    assert filter_results(results, text, Settings(allow_patterns=("Berlin",))) == results[0::2]
 
 
 def test_a_pattern_of_the_engine_alone_is_refused_by_re(caplog):
@@ -150,3 +176,71 @@ def test_a_pattern_of_the_engine_alone_is_refused_by_re(caplog):
     with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
         assert parse_allow_patterns(r"(?r)Berlin") == ()
     assert "Ignoring invalid allow-list pattern '(?r)Berlin'" in caplog.text
+
+
+def test_the_budget_counts_the_processor_time_of_the_thread_not_the_wall_clock():
+    """A file action and a task worker wait on each other for the GIL: waiting is not work. A pattern whose
+    matches wait is not skipped, where the wall clock made it run out of its budget."""
+    pause = 0.15  # the pass makes three engine calls, and this text has less than three pauses in its budget
+    berlin = regex.compile("Berlin")
+    around = Around(berlin, before=lambda name: time.sleep(pause))
+    text = "Anna Meyer works in Berlin."
+    results = [_result(0, 10), _result(20, 26)]
+    assert config._time_budget(text) < pause * 3
+    assert config._allow_listed(around, results, text) == {1}
+
+
+def test_a_match_the_engine_stops_for_the_work_of_other_threads_is_started_again():
+    """The engine counts the processor time of the whole process, so work that other threads do without the
+    GIL can stop a match on which this thread spent little: that match is run again, not treated as slow."""
+    berlin = regex.compile("Berlin")
+    text = "Anna Meyer works in Berlin."
+    results = [_result(0, 10), _result(20, 26)]
+
+    def stop_once(_name):
+        if around.calls == ["finditer"]:
+            raise TimeoutError
+
+    around = Around(berlin, before=stop_once)
+    assert config._allow_listed(around, results, text) == {1}
+    assert around.calls.count("finditer") == 2
+
+
+def test_a_match_that_keeps_stopping_is_given_up_after_a_few_starts():
+    def stop_always(_name):
+        raise TimeoutError
+
+    around = Around(regex.compile("Berlin"), before=stop_always)
+    with pytest.raises(TimeoutError):
+        config._allow_listed(around, [_result(20, 26)], "Anna Meyer works in Berlin.")
+    assert len(around.calls) == config._ENGINE_ATTEMPTS
+
+
+def _burn_the_gil(stop):
+    while not stop.is_set():
+        sum(i * i for i in range(1000))
+
+
+def test_a_sound_pattern_is_not_skipped_next_to_threads_that_work_at_the_same_time(caplog):
+    """The case of the maintainer: a file action and a task worker run CPU-heavy work at the same time. The
+    budget was counted on the wall clock, so a sound pattern ran out of it while it waited for the GIL. The
+    engine also gives the GIL up during a match and queues to take it back, which stretched the pass over
+    many seconds for a few hundredths of a second of work."""
+    text, results = _text_with_detections(4000)
+    settings = Settings(allow_patterns=("Berlin",))
+    assert filter_results(results, text, settings) == results[0::2]
+    stop = threading.Event()
+    threads = [threading.Thread(target=_burn_the_gil, args=(stop,), daemon=True) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    try:
+        time.sleep(0.1)
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            started = time.perf_counter()
+            assert filter_results(results, text, settings) == results[0::2]
+            assert time.perf_counter() - started < 2.0
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join()
+    assert caplog.text == ""

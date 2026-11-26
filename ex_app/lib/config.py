@@ -21,21 +21,24 @@ import os
 import re
 import time
 from bisect import bisect_right
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 import regex
 
 if TYPE_CHECKING:
     from presidio_analyzer import RecognizerResult
 
+T = TypeVar("T")
+
 LOGGER = logging.getLogger("text_anonymizer.config")
 
-#: Wall-clock seconds one allow-list pattern may spend on one analysis of a short text. A sound
-#: pattern needs microseconds there; one that needs more, such as a quantified group that
-#: backtracks on long text, is ignored for that analysis, so its entities are treated as not
-#: allow-listed.
+#: Processor seconds of its own that one allow-list pattern may spend on one analysis of a short
+#: text. It is the time of the thread and not of the clock, so that a file action and a task
+#: worker working at the same time do not make a sound pattern run out of it. A sound pattern
+#: needs microseconds; one that needs more, such as a quantified group that backtracks on long
+#: text, is ignored for that analysis, so its entities are treated as not allow-listed.
 ALLOW_PATTERN_TIME_BUDGET = 0.25
 
 #: What that budget grows by per character of the text: the engine scans the whole text once,
@@ -46,8 +49,8 @@ ALLOW_PATTERN_SECONDS_PER_CHARACTER = 1e-5
 #: What the budget of one pattern on one analysis never exceeds, whatever the length of the text.
 ALLOW_PATTERN_TIME_CAP = 5.0
 
-#: Allow-list patterns that ran out of time, so that the warning is logged once per process.
-_TIMED_OUT_PATTERNS: set[str] = set()
+#: How many times at the most a match that the engine stopped is started again (see :func:`_match`).
+_ENGINE_ATTEMPTS = 3
 
 #: The confidence threshold suggested in the settings form. No threshold is in force until
 #: the administrator saves one or the environment sets ``TEXT_ANONYMIZER_SCORE_THRESHOLD``;
@@ -245,21 +248,71 @@ def _widened_span(text: str, start: int, end: int) -> str:
 
 
 def _time_budget(text: str) -> float:
-    """Seconds one allow-list pattern may spend on ``text``: :data:`ALLOW_PATTERN_TIME_BUDGET` for a
-    short text, :data:`ALLOW_PATTERN_SECONDS_PER_CHARACTER` more per character, and
-    :data:`ALLOW_PATTERN_TIME_CAP` at the most."""
+    """Processor seconds of its own that one allow-list pattern may spend on ``text``:
+    :data:`ALLOW_PATTERN_TIME_BUDGET` for a short text, :data:`ALLOW_PATTERN_SECONDS_PER_CHARACTER`
+    more per character, and :data:`ALLOW_PATTERN_TIME_CAP` at the most."""
     return min(ALLOW_PATTERN_TIME_CAP, ALLOW_PATTERN_TIME_BUDGET + ALLOW_PATTERN_SECONDS_PER_CHARACTER * len(text))
 
 
-def _warn_timed_out(source: str, budget: float) -> None:
-    """Log, once per process, that ``source`` needs more time than the ``budget`` allows."""
-    if source not in _TIMED_OUT_PATTERNS:
-        _TIMED_OUT_PATTERNS.add(source)
-        LOGGER.warning(
-            "Ignoring allow-list pattern %r where it needs more than %.2f s; a quantified group in it may backtrack",
-            source,
-            budget,
-        )
+def _match(call: Callable[[float], T], seconds_left: Callable[[], float]) -> T:
+    """``call(limit)``: one match of the engine, limited to the ``seconds_left()`` of this thread.
+
+    The engine counts the processor time of the whole process, not of this thread: work that
+    other threads do without the GIL can stop a match on which this thread spent little. Such a
+    match is started again with what is left, at most :data:`_ENGINE_ATTEMPTS` times in all; the
+    result of a match does not depend on when it runs.
+    """
+    for _ in range(_ENGINE_ATTEMPTS):
+        limit = seconds_left()
+        started = time.thread_time()
+        try:
+            return call(limit)
+        except TimeoutError:
+            if time.thread_time() - started >= limit:
+                raise
+    raise TimeoutError
+
+
+def _regions(pattern: regex.Pattern, text: str, seconds_left: Callable[[], float]) -> list[tuple[int, int]]:
+    """The spans of the matches of ``pattern`` in ``text`` that hold at least one character.
+
+    The engine gives the GIL up during a match and has to queue to take it back, so next to a
+    thread that works in Python the matches of one analysis spent minutes waiting. With
+    concurrent=False the match keeps the GIL and the other threads run between the matches.
+
+    The engine finds the matches from left to right and never inside the one before, so the
+    regions are in the order of their start and do not overlap; (?r), which would reverse that,
+    is the engine's own syntax and re refuses the pattern before it comes here.
+    """
+
+    def find(limit: float) -> list[tuple[int, int]]:
+        found = []
+        for match in pattern.finditer(text, timeout=limit, concurrent=False):
+            if match.end() > match.start():
+                found.append(match.span())
+            seconds_left()
+        return found
+
+    return _match(find, seconds_left)
+
+
+def _matches(pattern: regex.Pattern, candidate: str, seconds_left: Callable[[], float]) -> bool:
+    """Whether ``pattern`` matches the whole of ``candidate``."""
+    return _match(lambda limit: pattern.fullmatch(candidate, timeout=limit, concurrent=False), seconds_left) is not None
+
+
+def _warn_timed_out(source: str, text: str, detections: int, budget: float) -> None:
+    """Log that ``source`` was ignored on ``text``: it spent the processor time ``budget`` it may
+    use on one analysis, so none of its names is kept there."""
+    LOGGER.warning(
+        "Ignoring allow-list pattern %r on a text of %d characters with %d detections: it used up its budget of"
+        " %.2f s of processor time, so none of its names is kept there. A group with a quantifier that can"
+        " match the same text in several ways needs time that grows fast with the length of the text.",
+        source,
+        len(text),
+        detections,
+        budget,
+    )
 
 
 def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text: str) -> set[int]:
@@ -269,22 +322,16 @@ def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text:
     on this call, so the caller drops every verdict of the pattern at once instead of keeping the
     entities it had matched before running out of time.
     """
-    deadline = time.perf_counter() + _time_budget(text)
+    budget = _time_budget(text)
+    started = time.thread_time()
 
     def seconds_left() -> float:
-        left = deadline - time.perf_counter()
+        left = budget - (time.thread_time() - started)
         if left <= 0:
             raise TimeoutError
         return left
 
-    # The engine finds the matches from left to right and never inside the one before, so the
-    # regions are in the order of their start and do not overlap; (?r), which would reverse that,
-    # is the engine's own syntax and re refuses the pattern before it comes here.
-    regions = []
-    for match in pattern.finditer(text, timeout=seconds_left()):
-        if match.end() > match.start():
-            regions.append(match.span())
-        seconds_left()
+    regions = _regions(pattern, text, seconds_left)
     starts = [start for start, _ in regions]
     listed = set()
     for index, result in enumerate(results):
@@ -293,9 +340,9 @@ def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text:
             continue
         span = text[start:end]
         widened = _widened_span(text, start, end)
-        if pattern.fullmatch(span, timeout=seconds_left()) is not None:
+        if _matches(pattern, span, seconds_left):
             listed.add(index)
-        elif pattern.fullmatch(widened, timeout=seconds_left()) is not None:
+        elif _matches(pattern, widened, seconds_left):
             listed.add(index)
         else:
             # The region with the greatest start at or before the detection is the only one that
@@ -321,8 +368,9 @@ def filter_results(results: list[RecognizerResult], text: str, settings: Setting
     longer name does not keep that name.
 
     Each pattern gets a time budget per call, :data:`ALLOW_PATTERN_TIME_BUDGET` for a short
-    text and more for a long one (see :func:`_time_budget`); a pattern that runs out of it is
-    ignored for the whole call, so no administrator's pattern can hold the task worker.
+    text and more for a long one (see :func:`_time_budget`), counted in the processor time of
+    the thread; a pattern that runs out of it is ignored for the whole call, so no
+    administrator's pattern can hold the task worker.
     """
     kept = []
     for result in results:
@@ -338,5 +386,5 @@ def filter_results(results: list[RecognizerResult], text: str, settings: Setting
         try:
             suppressed |= _allow_listed(pattern, kept, text)
         except TimeoutError:
-            _warn_timed_out(source, _time_budget(text))
+            _warn_timed_out(source, text, len(kept), _time_budget(text))
     return [result for index, result in enumerate(kept) if index not in suppressed]
