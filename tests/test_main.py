@@ -145,7 +145,11 @@ def test_enabled_handler_registers_features(events):
     assert main.enabled_handler(True, nc) == ""
 
     registered = [call.args[0].id for call in nc.providers.task_processing.register.call_args_list]
-    assert registered == ["text_anonymizer:detect_pii", "text_anonymizer:redact_pii"]
+    assert registered == [
+        "text_anonymizer:detect_pii",
+        "text_anonymizer:redact_pii",
+        "text_anonymizer:contains_pii",
+    ]
     nc.ui.files_dropdown_menu.register_ex.assert_called_once()
     assert nc.ui.files_dropdown_menu.register_ex.call_args.args[0] == main.REDACT_FILE_ACTION_NAME
     assert main.APP_ENABLED.is_set()
@@ -158,7 +162,11 @@ def test_enabled_handler_unregisters_features(events):
     assert main.enabled_handler(False, nc) == ""
 
     unregistered = [call.args[0] for call in nc.providers.task_processing.unregister.call_args_list]
-    assert unregistered == ["text_anonymizer:detect_pii", "text_anonymizer:redact_pii"]
+    assert unregistered == [
+        "text_anonymizer:detect_pii",
+        "text_anonymizer:redact_pii",
+        "text_anonymizer:contains_pii",
+    ]
     nc.ui.files_dropdown_menu.unregister.assert_called_once_with(main.REDACT_FILE_ACTION_NAME)
     assert not main.APP_ENABLED.is_set()
 
@@ -190,10 +198,10 @@ def make_async_nc():
 
 
 def test_process_task_reports_output_and_progress(monkeypatch):
-    def handler(text, on_progress):
+    def handler(task_input, on_progress):
         on_progress(50.0)
         on_progress(100.0)
-        return text.upper()
+        return {"output": task_input["input"].upper()}
 
     monkeypatch.setitem(main.TASK_HANDLERS, "text_anonymizer:redact_pii", handler)
     nc = make_async_nc()
@@ -226,8 +234,9 @@ def test_process_tasks_fetches_and_processes_until_shutdown(monkeypatch, events)
     task = {"id": 1, "type": "text_anonymizer:detect_pii", "input": {"input": "hello"}}
 
     async def next_task(provider_ids, task_types):
-        assert provider_ids == ["text_anonymizer:detect_pii", "text_anonymizer:redact_pii"]
-        assert task_types == ["text_anonymizer:detect_pii", "text_anonymizer:redact_pii"]
+        expected = ["text_anonymizer:detect_pii", "text_anonymizer:redact_pii", "text_anonymizer:contains_pii"]
+        assert provider_ids == expected
+        assert task_types == expected
         if nc.providers.task_processing.next_task.await_count == 1:
             return {"task": task}
         main.SHUTDOWN.set()
