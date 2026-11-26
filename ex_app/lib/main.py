@@ -5,25 +5,32 @@
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import posixpath
-import re
+import queue
 import threading
-from contextlib import asynccontextmanager
+import time
+from collections.abc import Iterable
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any
 
+import batch
 from anonymizer import detect_pii, redact_text
+from batch import LOGGER as BATCH_LOGGER
+from batch import BatchReport, oversize_detail, redact_file_copy, redact_folder
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from nc_py_api import AsyncNextcloudApp, NextcloudApp, NextcloudException
+from nc_py_api import AsyncNextcloudApp, NextcloudApp
 from nc_py_api.ex_app import (
     AppAPIAuthMiddleware,
     LogLvl,
     anc_app,
     run_app,
     set_handlers,
+    setup_nextcloud_logging,
 )
 from nc_py_api.ex_app.providers.task_processing import (
     ShapeDescriptor,
@@ -36,8 +43,81 @@ from nc_py_api.files import ActionFileInfo, ActionFileInfoEx
 LOGGER = logging.getLogger(__name__)
 
 
+# The app's log lines are sent to Nextcloud from a thread of their own, so that no thread that logs waits
+# for the request: neither the event loop, which must stay free for AppAPI's heartbeat, nor a folder run
+# between two files.
+LOG_QUEUE_SIZE = 200
+# How long the shutdown waits for lines that are not sent yet.
+LOG_FLUSH_SECONDS = 2.0
+# The level Nextcloud logs at, indexed by the loglevel AppAPI publishes in its capabilities: 0 debug, 1 info,
+# 2 warning, 3 error.
+LOG_LEVELS = (logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR)
+
+
+class _LogQueueHandler(logging.handlers.QueueHandler):
+    """Puts the lines of the app's loggers on the queue of the sending thread."""
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        # The queue fills when lines come faster than the sender sends them: while Nextcloud does not answer, or
+        # when one folder listing names hundreds of files.
+        with suppress(queue.Full):
+            self.queue.put_nowait(record)
+
+
+def log_at_nextcloud_level(nc: NextcloudApp) -> None:
+    """Log at the level Nextcloud logs at, which AppAPI publishes in the capabilities of a logged-in user.
+
+    The level stays where it is when the capabilities do not carry the loglevel.
+    """
+    with suppress(KeyError, IndexError, TypeError, ValueError):
+        level = LOG_LEVELS[int(nc.capabilities["app_api"]["loglevel"])]
+        for logger in (LOGGER, BATCH_LOGGER):
+            logger.setLevel(level)
+
+
+def configure_logging() -> logging.handlers.QueueListener:
+    """Send what the app's own loggers log to nextcloud.log.
+
+    Every line sent is one request to Nextcloud, whatever its level; Nextcloud drops a line below its loglevel
+    after it was sent. So the app logs at that level, which each Files action reads (see
+    ``log_at_nextcloud_level``): the progress of a folder run is DEBUG and reaches nextcloud.log only while
+    Nextcloud logs debug. Libraries log one INFO line per request or per redaction and are not sent at all.
+    """
+    log_queue: queue.Queue[logging.LogRecord] = queue.Queue(LOG_QUEUE_SIZE)
+    for logger in (LOGGER, BATCH_LOGGER):
+        logger.setLevel(logging.INFO)
+        logger.addHandler(_LogQueueHandler(log_queue))
+    nextcloud_handler = setup_nextcloud_logging()
+    logging.getLogger().removeHandler(nextcloud_handler)  # nc_py_api attaches it to the root logger
+    sender = logging.handlers.QueueListener(log_queue, nextcloud_handler)
+    sender.start()
+    return sender
+
+
+def _stop_sender(sender: logging.handlers.QueueListener) -> None:
+    # A full queue refuses the stop sign of the listener until the listener has sent a line.
+    while True:
+        try:
+            sender.stop()
+        except queue.Full:
+            time.sleep(0.05)
+        else:
+            return
+
+
+def flush_logs(sender: logging.handlers.QueueListener) -> None:
+    """Send what is queued before the app ends, but wait at most ``LOG_FLUSH_SECONDS``.
+
+    A sender that waits for the answer of a request it has already made is left to end with the process.
+    """
+    stopper = threading.Thread(target=_stop_sender, args=(sender,), daemon=True)
+    stopper.start()
+    stopper.join(LOG_FLUSH_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log_sender = configure_logging()
     set_handlers(app, enabled_handler, trigger_handler=trigger_handler)
     if NextcloudApp().enabled_state:
         APP_ENABLED.set()
@@ -46,6 +126,7 @@ async def lifespan(app: FastAPI):
     SHUTDOWN.set()
     TRIGGER.set()
     await worker
+    flush_logs(log_sender)
 
 
 APP = FastAPI(lifespan=lifespan)
@@ -160,40 +241,16 @@ async def process_tasks() -> None:
 
 
 REDACT_FILE_ACTION_NAME = "redact_pii_file"
+REDACT_FOLDER_ACTION_NAME = "redact_pii_folder"
 REDACT_FILE_ACTION_HANDLER = "/redact_file"
 # AppAPI matches by substring, so "text/" matches all text/* types but not e.g. ODT documents.
 REDACT_FILE_ACTION_MIME = "text/"
+# The Files app gives every folder the MIME type "httpd/unix-directory"; "dir" alone would also match file
+# types such as "application/x-director".
+REDACT_FOLDER_ACTION_MIME = "unix-directory"
 # AppAPI passes an unset default action to the Files app as `null`, which the Files app treats as a default action.
 # Ordering after the built-in "Download" action (30) keeps any real default action, e.g. "View", ahead of this one.
 REDACT_FILE_ACTION_ORDER = 31
-REDACTED_SUFFIX_RE = re.compile(r" \(redacted(?: \d+)?\)$")
-
-
-def path_exists(nc: NextcloudApp, user_path: str) -> bool:
-    try:
-        nc.files.by_path(user_path)
-    except NextcloudException as e:
-        # WebDAV lookups raise a plain NextcloudException for a missing path, not NextcloudExceptionNotFound.
-        if e.status_code == 404:
-            return False
-        raise
-    return True
-
-
-def redacted_copy_path(nc: NextcloudApp, user_path: str) -> str:
-    """Return a free path next to ``user_path`` for the redacted copy, e.g. ``notes (redacted).txt``.
-
-    Redacting an existing copy such as ``notes (redacted).txt`` yields ``notes (redacted 2).txt``.
-    """
-    directory, name = posixpath.split(user_path)
-    stem, ext = posixpath.splitext(name)
-    stem = REDACTED_SUFFIX_RE.sub("", stem)
-    candidate = posixpath.join(directory, f"{stem} (redacted){ext}")
-    counter = 2
-    while path_exists(nc, candidate):
-        candidate = posixpath.join(directory, f"{stem} (redacted {counter}){ext}")
-        counter += 1
-    return candidate
 
 
 def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
@@ -203,24 +260,132 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
         if node is None or node.is_dir:
             nc.notifications.create(f"Could not redact {file_info.name}", "The file could not be found.")
             return
+        reason = oversize_detail(node.info.size)
+        if reason is not None:
+            nc.notifications.create(f"Could not redact {node.name}", f"The file is {reason} and was skipped.")
+            return
+        if batch.is_redacted_copy(node.user_path):
+            nc.notifications.create(f"{node.name} is already a redacted copy")
+            return
+        # The Files action has no language input surface; English is redact_text's default.
         try:
-            text = nc.files.download(node).decode("utf-8")
+            copy_path = redact_file_copy(nc, node, redact_text)
         except UnicodeDecodeError:
             nc.notifications.create(f"Could not redact {node.name}", "The file is not a UTF-8 encoded text file.")
             return
-        copy_path = redacted_copy_path(nc, node.user_path)
-        nc.files.upload(copy_path, redact_text(text))
+        if copy_path is None:
+            nc.notifications.create(f"A redacted copy of {node.name} is already up to date")
+            return
         nc.notifications.create(f"Redacted copy of {node.name} saved as {posixpath.basename(copy_path)}")
     except Exception as e:
         nc.log(LogLvl.ERROR, f"Failed to redact file {file_info.fileId}: {e}")
         nc.notifications.create(f"Could not redact {file_info.name}", "An unexpected error occurred.")
 
 
+def _log_batch_progress(index: int, total: int, name: str) -> None:
+    # One line per file would be one request per file: DEBUG, so that it is sent only while Nextcloud logs debug.
+    LOGGER.debug("Redacting %s (%d of %d)", name, index, total)
+
+
+def redact_folder_action(nc: NextcloudApp, dir_info: ActionFileInfo) -> None:
+    """Redact every text file under the folder recursively and notify the user with one summary."""
+    try:
+        node = nc.files.by_id(dir_info.fileId)
+        if node is None or not node.is_dir:
+            nc.notifications.create(f"Could not redact text files in {dir_info.name}", "The folder could not be found.")
+            return
+        # The permissions of this folder are known here; a subfolder in which nothing can be created fails file by file.
+        if not node.is_creatable:
+            LOGGER.warning("Not redacting %s: no file can be created in this folder", node.user_path)
+            nc.notifications.create(
+                f"Could not redact text files in {dir_info.name}",
+                "No file can be created in this folder, so no redacted copy can be written.",
+            )
+            return
+        # A Files action has no task ID, so task progress cannot be reported through TaskProcessing;
+        # each file is reported through the progress callback instead. Files actions also have no
+        # language input surface, so the batch runs the default English pipeline.
+        report = redact_folder(nc, node, on_progress=_log_batch_progress)
+        notify_batch_summary(nc, report)
+    except Exception as e:
+        nc.log(LogLvl.ERROR, f"Failed to redact text files in {dir_info.fileId}: {e}")
+        nc.notifications.create(f"Could not redact text files in {dir_info.name}", "An unexpected error occurred.")
+
+
+def notify_batch_summary(nc: NextcloudApp, report: BatchReport) -> None:
+    """Send a single notification summarizing how many files were processed, redacted, failed and skipped."""
+    if not report.found_any:
+        nc.notifications.create(
+            f"No text files in {report.folder_name}",
+            f"No redactable text files were found in {report.folder_name}.",
+        )
+        return
+    # Notification bodies are fetched by every client of the user, so they carry counts only;
+    # the server log names the files that were skipped or failed and the folders that could not be read.
+    message = (
+        f"{report.processed_count} files processed, {len(report.redacted)} redacted, "
+        f"{len(report.failed)} failed, {len(report.skipped)} skipped."
+    )
+    unreadable = len(report.unreadable_folders)
+    if unreadable:
+        message += f" {unreadable} folder{'s' if unreadable > 1 else ''} could not be read."
+    nc.notifications.create(f"Redacted text files in {report.folder_name}", message)
+
+
+# Files actions run as background tasks, and a double click can dispatch the same request twice within about a
+# second. The nodes of a request are claimed when it starts: one on which an action of the same user runs already
+# is left out, as it could only wait for the first one and then report its files as skipped, and the user is told
+# so by a notification. Copies are kept unique by the lock of each original file (see ``redact_file_copy``), which
+# also covers a folder run and a file action on one file.
+_ACTIONS_RUNNING: set[tuple[str, int]] = set()
+_ACTIONS_RUNNING_GUARD = threading.Lock()
+
+
+def _claim_nodes(user_id: str, file_ids: Iterable[int]) -> set[int]:
+    """Claim each node for an action of the user unless one runs already; return the file ids of those."""
+    with _ACTIONS_RUNNING_GUARD:
+        running = {file_id for file_id in file_ids if (user_id, file_id) in _ACTIONS_RUNNING}
+        _ACTIONS_RUNNING.update((user_id, file_id) for file_id in file_ids if file_id not in running)
+    return running
+
+
+def _release_nodes(user_id: str, file_ids: Iterable[int]) -> None:
+    """Give nodes back, so that a later action of the user on them runs."""
+    with _ACTIONS_RUNNING_GUARD:
+        _ACTIONS_RUNNING.difference_update((user_id, file_id) for file_id in file_ids)
+
+
+def notify_actions_running(nc: NextcloudApp, files: list[ActionFileInfo]) -> None:
+    """Tell the user that their request on ``files`` was left out because an action on them runs already."""
+    if len(files) == 1:
+        subject = f"{files[0].name} is already being redacted"
+    else:
+        subject = f"{len(files)} of the selected files are already being redacted"
+    try:
+        nc.notifications.create(
+            subject, "This request was ignored. The result of the one started first comes as a separate notification."
+        )
+    except Exception as e:
+        LOGGER.error("Failed to tell the user that an action on %s runs already: %s", files[0].name, e)
+
+
 def redact_files(user_id: str, files: list[ActionFileInfo]) -> None:
     nc = NextcloudApp()
     nc.set_user(user_id)
-    for file_info in files:
-        redact_file(nc, file_info)
+    log_at_nextcloud_level(nc)  # the capabilities of the user are fetched by set_user; this costs no request
+    running = _claim_nodes(user_id, {file_info.fileId for file_info in files})
+    todo = [file_info for file_info in files if file_info.fileId not in running]
+    if running:
+        notify_actions_running(nc, [file_info for file_info in files if file_info.fileId in running])
+    try:
+        for file_info in todo:
+            # AppAPI's Files payload reports directories as "folder" (current files plugin)
+            # or "dir" (older payloads); both dispatch to the folder action.
+            redact = redact_folder_action if file_info.fileType.lower() in ("dir", "folder") else redact_file
+            redact(nc, file_info)
+            _release_nodes(user_id, [file_info.fileId])
+    finally:
+        _release_nodes(user_id, [file_info.fileId for file_info in todo])
 
 
 @APP.post(REDACT_FILE_ACTION_HANDLER)
@@ -249,12 +414,21 @@ def enabled_handler(enabled: bool, nc: NextcloudApp) -> str:
                 icon="img/icon.svg",
                 order=REDACT_FILE_ACTION_ORDER,
             )
+            nc.ui.files_dropdown_menu.register_ex(
+                REDACT_FOLDER_ACTION_NAME,
+                "Redact all text files",
+                REDACT_FILE_ACTION_HANDLER,
+                mime=REDACT_FOLDER_ACTION_MIME,
+                icon="img/icon.svg",
+                order=REDACT_FILE_ACTION_ORDER,
+            )
             APP_ENABLED.set()
         else:
             APP_ENABLED.clear()
             for provider, _ in TASK_PROCESSING_PROVIDERS:
                 nc.providers.task_processing.unregister(provider.id)
             nc.ui.files_dropdown_menu.unregister(REDACT_FILE_ACTION_NAME)
+            nc.ui.files_dropdown_menu.unregister(REDACT_FOLDER_ACTION_NAME)
     except Exception as e:
         nc.log(LogLvl.ERROR, f"Failed to {'register' if enabled else 'unregister'} app features: {e}")
         # A non-empty string is shown to the Nextcloud administrator as an error.

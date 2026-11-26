@@ -22,7 +22,9 @@ It uses [Presidio](https://presidio.dataprivacystack.org/) under the hood, with 
 - **"Redact text" action in Files.** Text files have a "Redact text" entry in their action menu. It saves a redacted
   copy next to the original, e.g. `notes (redacted).txt` (then `notes (redacted 2).txt`, and so on), and leaves the
   original file unchanged. A notification tells the user when the copy is ready or why it failed. Files are read and
-  written as the user who started the action, so Nextcloud's usual file permissions apply.
+  written as the user who started the action, so Nextcloud's usual file permissions apply. A redacted copy is never
+  redacted again: when the original has changed since, a new copy is written next to the older one, which stays
+  until it is deleted.
 - **Detects Presidio's built-in entity types**, such as names, email addresses, phone numbers, locations, dates,
   credit card numbers, IBANs, IP addresses, URLs and several country-specific ID numbers. See Presidio's
   [list of supported entities](https://presidio.dataprivacystack.org/supported_entities/).

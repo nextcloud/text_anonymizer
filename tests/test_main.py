@@ -47,43 +47,6 @@ def events(monkeypatch):
     monkeypatch.setattr(main, "APP_ENABLED", main.threading.Event())
 
 
-def test_path_exists():
-    nc = make_nc({"/a.txt"})
-    assert main.path_exists(nc, "/a.txt")
-    assert not main.path_exists(nc, "/b.txt")
-
-
-def test_path_exists_reraises_other_errors():
-    nc = MagicMock()
-    nc.files.by_path.side_effect = NextcloudException(500, "Server Error")
-    with pytest.raises(NextcloudException):
-        main.path_exists(nc, "/a.txt")
-
-
-@pytest.mark.parametrize(
-    ("user_path", "existing", "expected"),
-    [
-        ("/notes.txt", (), "/notes (redacted).txt"),
-        ("/dir/notes.md", (), "/dir/notes (redacted).md"),
-        ("/README", (), "/README (redacted)"),
-        ("/notes.txt", ("/notes (redacted).txt",), "/notes (redacted 2).txt"),
-        (
-            "/notes.txt",
-            ("/notes (redacted).txt", "/notes (redacted 2).txt"),
-            "/notes (redacted 3).txt",
-        ),
-        ("/notes (redacted).txt", ("/notes (redacted).txt",), "/notes (redacted 2).txt"),
-        (
-            "/notes (redacted 2).txt",
-            ("/notes (redacted).txt", "/notes (redacted 2).txt"),
-            "/notes (redacted 3).txt",
-        ),
-    ],
-)
-def test_redacted_copy_path(user_path, existing, expected):
-    assert main.redacted_copy_path(make_nc(existing), user_path) == expected
-
-
 def test_redact_file_uploads_redacted_copy(monkeypatch):
     monkeypatch.setattr(main, "redact_text", lambda text: text.replace("John", "<PERSON>"))
     nc = make_nc()
@@ -91,7 +54,10 @@ def test_redact_file_uploads_redacted_copy(monkeypatch):
     node.is_dir = False
     node.name = "notes.txt"
     node.user_path = "/dir/notes.txt"
+    node.info.size = 10
     nc.files.download.return_value = b"Hi John"
+    node.etag_unquoted = "etag-of-the-original"  # the record keeps the etag the copy was made from
+    nc.files.upload.return_value.file_id = "00000099ocinstance"  # the upload answers with the full file id of the copy
 
     main.redact_file(nc, make_file_info())
 
@@ -119,6 +85,7 @@ def test_redact_file_non_utf8():
     node = nc.files.by_id.return_value
     node.is_dir = False
     node.name = "image.txt"
+    node.info.size = 10
     nc.files.download.return_value = b"\xff\xfe\x00"
 
     main.redact_file(nc, make_file_info(name="image.txt"))
@@ -146,8 +113,11 @@ def test_enabled_handler_registers_features(events):
 
     registered = [call.args[0].id for call in nc.providers.task_processing.register.call_args_list]
     assert registered == ["text_anonymizer:detect_pii", "text_anonymizer:redact_pii"]
-    nc.ui.files_dropdown_menu.register_ex.assert_called_once()
-    assert nc.ui.files_dropdown_menu.register_ex.call_args.args[0] == main.REDACT_FILE_ACTION_NAME
+    actions = nc.ui.files_dropdown_menu.register_ex.call_args_list
+    assert [(action.args, action.kwargs["mime"]) for action in actions] == [
+        ((main.REDACT_FILE_ACTION_NAME, "Redact text", main.REDACT_FILE_ACTION_HANDLER), "text/"),
+        ((main.REDACT_FOLDER_ACTION_NAME, "Redact all text files", main.REDACT_FILE_ACTION_HANDLER), "unix-directory"),
+    ]
     assert main.APP_ENABLED.is_set()
 
 
@@ -159,7 +129,8 @@ def test_enabled_handler_unregisters_features(events):
 
     unregistered = [call.args[0] for call in nc.providers.task_processing.unregister.call_args_list]
     assert unregistered == ["text_anonymizer:detect_pii", "text_anonymizer:redact_pii"]
-    nc.ui.files_dropdown_menu.unregister.assert_called_once_with(main.REDACT_FILE_ACTION_NAME)
+    unregistered = [call.args[0] for call in nc.ui.files_dropdown_menu.unregister.call_args_list]
+    assert unregistered == [main.REDACT_FILE_ACTION_NAME, main.REDACT_FOLDER_ACTION_NAME]
     assert not main.APP_ENABLED.is_set()
 
 
