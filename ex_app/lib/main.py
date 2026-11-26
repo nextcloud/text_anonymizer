@@ -4,6 +4,7 @@
 """ExApp server providing TaskProcessing tasks and a Files action for detecting and redacting PII."""
 
 import asyncio
+import json
 import logging
 import os
 import posixpath
@@ -13,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from anonymizer import contains_pii, detect_pii, redact_text
+from anonymizer import contains_pii, detect_pii, pseudonymize_text, redact_text
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +28,7 @@ from nc_py_api.ex_app import (
 )
 from nc_py_api.ex_app.providers.task_processing import (
     ShapeDescriptor,
+    ShapeEnumValue,
     ShapeType,
     TaskProcessingProvider,
     TaskType,
@@ -82,6 +84,30 @@ REDACT_PII_PROVIDER = TaskProcessingProvider(
     id=REDACT_PII_TASK_TYPE.id,
     name="TextAnonymizer PII Redactor",
     task_type=REDACT_PII_TASK_TYPE.id,
+    optional_input_shape=[
+        ShapeDescriptor(
+            name="mode",
+            description=(
+                "Replace PII with plain placeholders, or number unique entities per type"
+                " and report a reversible mapping"
+            ),
+            shape_type=ShapeType.ENUM,
+        ),
+    ],
+    optional_input_shape_enum_values={
+        "mode": [
+            ShapeEnumValue(name="Redact", value="redact"),
+            ShapeEnumValue(name="Pseudonymize", value="pseudonymize"),
+        ],
+    },
+    optional_input_shape_defaults={"mode": "redact"},
+    optional_output_shape=[
+        ShapeDescriptor(
+            name="mapping",
+            description="JSON object mapping each pseudonymization placeholder to its original value",
+            shape_type=ShapeType.TEXT,
+        )
+    ],
 )
 
 # TaskProcessing has no boolean shape type, so the result is carried as the text "true" or "false".
@@ -116,6 +142,9 @@ def handle_contains_pii(task_input: dict[str, Any], on_progress=None) -> dict[st
 
 
 def handle_redact_pii(task_input: dict[str, Any], on_progress=None) -> dict[str, str]:
+    if task_input.get("mode", "redact") == "pseudonymize":
+        output, mapping = pseudonymize_text(task_input["input"], on_progress=on_progress)
+        return {"output": output, "mapping": json.dumps(mapping, ensure_ascii=False)}
     return {"output": redact_text(task_input["input"], on_progress=on_progress)}
 
 

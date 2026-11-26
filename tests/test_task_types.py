@@ -4,6 +4,7 @@
 """Tests for the TaskProcessing task types and their output formats."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -226,3 +227,160 @@ def test_contains_pii_task_type_says_true_false() -> None:
     assert "true/false" in main.CONTAINS_PII_TASK_TYPE.description
     assert "yes/no" not in main.CONTAINS_PII_TASK_TYPE.output_shape[0].description
     assert '"true" or "false"' in main.CONTAINS_PII_TASK_TYPE.output_shape[0].description
+
+
+def test_pseudonymize_mode_numbers_unique_entities(set_engines) -> None:
+    set_engines(TEXT_RESULTS)
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT, "mode": "pseudonymize"})
+    assert output["output"] == "<PERSON_1> met <PERSON_2> at <EMAIL_ADDRESS_1>."
+    assert json.loads(output["mapping"]) == {
+        "<PERSON_1>": "Alice",
+        "<PERSON_2>": "Bob",
+        "<EMAIL_ADDRESS_1>": "bob@example.com",
+    }
+
+
+def restore(pseudonymized: str, mapping: dict[str, str]) -> str:
+    """Replace each key by its value, the way ``pseudonymize_text`` says the original is restored."""
+    for placeholder, value in mapping.items():
+        pseudonymized = pseudonymized.replace(placeholder, value)
+    return pseudonymized
+
+
+def test_pseudonymize_mode_keys_are_the_placeholders_of_the_text(set_engines) -> None:
+    names = ["Alice", "Bob", "Carol", "Dave", "Erin", "Frank", "Grace", "Heidi", "Ivan", "Judy", "Mallory", "Niaj"]
+    text = " ".join(f"{name} was there." for name in names)
+    set_engines([entity("PERSON", name, text) for name in names])
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+    mapping = json.loads(output["mapping"])
+
+    assert list(mapping) == [f"<PERSON_{number}>" for number in range(1, 13)]
+    assert restore(output["output"], mapping) == text
+
+
+def test_pseudonymize_mode_skips_a_placeholder_the_text_holds(set_engines) -> None:
+    text = "Template uses <PERSON_1>; contact Alice."
+    set_engines([entity("PERSON", "Alice", text)])
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+
+    assert output["output"] == "Template uses <PERSON_1>; contact <PERSON_2>."
+    assert json.loads(output["mapping"]) == {"<PERSON_2>": "Alice"}
+    assert restore(output["output"], json.loads(output["mapping"])) == text
+
+
+ONLY_ALICE = [("PERSON", "Alice")]
+
+
+@pytest.mark.parametrize(
+    ("text", "entities", "expected"),
+    [
+        # The numbering takes the numbers the text leaves free, whatever their length.
+        (
+            "Template uses <PERSON_1> and <PERSON_3>; contact Alice, Bob and Carol.",
+            [("PERSON", "Alice"), ("PERSON", "Bob"), ("PERSON", "Carol")],
+            {"<PERSON_2>": "Alice", "<PERSON_4>": "Bob", "<PERSON_5>": "Carol"},
+        ),
+        ("Contact <PERSON_999999999> or <PERSON_1000000000>. Alice knows.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        # A value that holds a placeholder of the text.
+        (
+            "Meet Alice and Bob <PERSON_1>.",
+            [("PERSON", "Alice"), ("LOCATION", "Bob <PERSON_1>")],
+            {"<PERSON_2>": "Alice", "<LOCATION_1>": "Bob <PERSON_1>"},
+        ),
+        # Other types and other spellings, which the task never writes.
+        ("Call <PHONE_NUMBER_1> now. This is Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        ("Template uses <FOO_1>; contact Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        ("Template uses <PERSON_01>; contact Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        ("Template uses [PERSON_1]; contact Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+        ("Template uses <person_1>; contact Alice.", ONLY_ALICE, {"<PERSON_1>": "Alice"}),
+    ],
+)
+def test_pseudonymize_mode_restores_a_text_that_holds_placeholders(set_engines, text, entities, expected) -> None:
+    set_engines([entity(entity_type, value, text) for entity_type, value in entities])
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+    mapping = json.loads(output["mapping"])
+
+    assert mapping == expected
+    assert not any(placeholder in text for placeholder in mapping)
+    for keys in (list(mapping), list(reversed(mapping))):
+        assert restore(output["output"], {key: mapping[key] for key in keys}) == text
+
+
+def test_pseudonymize_mode_skips_fifty_thousand_placeholders(monkeypatch) -> None:
+    text = " ".join(f"<PERSON_{number}>" for number in range(1, 50_001)) + " Alice"
+    monkeypatch.setattr(anonymizer, "_get_engines", lambda: (ChunkAnalyzer(), AnonymizerEngine()))
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+
+    assert json.loads(output["mapping"]) == {"<PERSON_50001>": "Alice"}
+    assert restore(output["output"], json.loads(output["mapping"])) == text
+
+
+def test_pseudonymize_mode_reuses_placeholders_for_repeated_values(set_engines) -> None:
+    text = "Bob met Alice. Bob left."
+    set_engines(
+        [
+            RecognizerResult(entity_type="PERSON", start=0, end=3, score=0.9),
+            RecognizerResult(entity_type="PERSON", start=8, end=13, score=0.9),
+            RecognizerResult(entity_type="PERSON", start=15, end=18, score=0.9),
+        ]
+    )
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+    assert output["output"] == "<PERSON_1> met <PERSON_2>. <PERSON_1> left."
+    assert json.loads(output["mapping"]) == {"<PERSON_1>": "Bob", "<PERSON_2>": "Alice"}
+
+
+def test_pseudonymize_mode_resolves_overlapping_entities(set_engines) -> None:
+    text = "John Smith"
+    set_engines(
+        [
+            RecognizerResult(entity_type="LOCATION", start=0, end=4, score=0.8),
+            RecognizerResult(entity_type="PERSON", start=0, end=10, score=0.9),
+        ]
+    )
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+    assert output["output"] == "<PERSON_1>"
+    assert json.loads(output["mapping"]) == {"<PERSON_1>": "John Smith"}
+
+
+def test_pseudonymize_mode_resolves_overlaps_with_the_shared_helper(monkeypatch, set_engines) -> None:
+    set_engines(TEXT_RESULTS)
+    resolve_overlaps = anonymizer._resolve_overlaps
+    resolved = []
+
+    def spy(anonymizer_engine, text, results):
+        items = resolve_overlaps(anonymizer_engine, text, results)
+        resolved.append([(item.entity_type, item.start, item.end) for item in items])
+        return items
+
+    monkeypatch.setattr(anonymizer, "_resolve_overlaps", spy)
+    main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT, "mode": "pseudonymize"})
+
+    assert len(resolved) == 1
+    assert sorted(resolved[0]) == [("EMAIL_ADDRESS", 17, 32), ("PERSON", 0, 5), ("PERSON", 10, 13)]
+
+
+def test_pseudonymize_mode_without_pii_reports_empty_mapping(set_engines) -> None:
+    set_engines([])
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": "Nothing here.", "mode": "pseudonymize"})
+    assert output == {"output": "Nothing here.", "mapping": "{}"}
+
+
+def test_redact_handler_with_explicit_mode_reports_no_mapping(set_engines) -> None:
+    set_engines(TEXT_RESULTS)
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT, "mode": "redact"})
+    assert output == {"output": "<PERSON> met <PERSON> at <EMAIL_ADDRESS>."}
+
+
+def test_redact_task_mode_and_mapping_shapes() -> None:
+    provider = main.REDACT_PII_PROVIDER
+    assert [(d.name, d.shape_type) for d in provider.optional_input_shape] == [
+        ("mode", ShapeType.ENUM),
+    ]
+    assert [(v.name, v.value) for v in provider.optional_input_shape_enum_values["mode"]] == [
+        ("Redact", "redact"),
+        ("Pseudonymize", "pseudonymize"),
+    ]
+    assert provider.optional_input_shape_defaults == {"mode": "redact"}
+    assert [(d.name, d.shape_type) for d in provider.optional_output_shape] == [("mapping", ShapeType.TEXT)]
+    assert [(d.name, d.shape_type) for d in main.REDACT_PII_TASK_TYPE.output_shape] == [("output", ShapeType.TEXT)]
+    assert [(d.name, d.shape_type) for d in main.REDACT_PII_TASK_TYPE.input_shape] == [("input", ShapeType.TEXT)]

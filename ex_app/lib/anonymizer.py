@@ -3,6 +3,7 @@
 
 """PII detection and redaction using Presidio."""
 
+import re
 import threading
 from collections.abc import Callable, Iterator
 
@@ -107,6 +108,49 @@ def contains_pii(text: str, language: str = "en", on_progress: ProgressCallback 
         if any(item.entity_type not in NON_IDENTIFYING_TYPES for item in items):
             return True
     return False
+
+
+def pseudonymize_text(
+    text: str, language: str = "en", on_progress: ProgressCallback | None = None
+) -> tuple[str, dict[str, str]]:
+    """Replace every PII entity with a numbered placeholder per unique entity, e.g. ``<PERSON_1>``.
+
+    Each distinct pair of entity type and value is numbered per type in order of first appearance, so the same
+    value always resolves to the same placeholder. Returns the pseudonymized text and a mapping of each
+    placeholder, e.g. ``<PERSON_1>``, to its original value, to be kept by the data controller for
+    re-identification.
+
+    A placeholder the text already holds is never assigned, so no key of the mapping occurs in the input and
+    the original text is restored by replacing each key in the output by its value.
+    """
+    analyzer, anonymizer = _get_engines()
+    results = _analyze(analyzer, text, language, on_progress)
+    items = _resolve_overlaps(anonymizer, text, results)
+    # Every bracketed token of the text, so it holds each placeholder the text already has.
+    taken = set(re.findall(r"<[^<>]*>", text))
+    placeholders: dict[tuple[str, str], str] = {}
+    counters: dict[str, int] = {}
+    for item in sorted(items, key=lambda item: item.start):
+        key = (item.entity_type, item.text)
+        if key not in placeholders:
+            number = counters.get(item.entity_type, 0) + 1
+            while f"<{item.entity_type}_{number}>" in taken:
+                number += 1
+            counters[item.entity_type] = number
+            placeholders[key] = f"<{item.entity_type}_{number}>"
+
+    def assign(entity_type: str) -> Callable[[str], str]:
+        def replace(value: str) -> str:
+            return placeholders[(entity_type, value)]
+
+        return replace
+
+    operators = {
+        entity_type: OperatorConfig("custom", {"lambda": assign(entity_type)})
+        for entity_type in {result.entity_type for result in results}
+    }
+    pseudonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators).text
+    return pseudonymized, {placeholder: value for (_, value), placeholder in placeholders.items()}
 
 
 def redact_text(text: str, language: str = "en", on_progress: ProgressCallback | None = None) -> str:
