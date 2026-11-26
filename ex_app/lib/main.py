@@ -4,16 +4,27 @@
 """ExApp server providing TaskProcessing tasks and a Files action for detecting and redacting PII."""
 
 import asyncio
+import functools
 import logging
 import os
 import posixpath
 import re
 import threading
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
 from anonymizer import detect_pii, redact_text
+from config import (
+    ADMIN_CONFIG_KEYS,
+    DEFAULT_SCORE_THRESHOLD,
+    ENV_ALLOW_PATTERNS,
+    ENV_IGNORED_ENTITY_TYPES,
+    ENV_SCORE_THRESHOLD,
+    Settings,
+    apply_admin_config,
+)
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +42,7 @@ from nc_py_api.ex_app.providers.task_processing import (
     TaskProcessingProvider,
     TaskType,
 )
+from nc_py_api.ex_app.ui.settings import SettingsField, SettingsFieldType, SettingsForm
 from nc_py_api.files import ActionFileInfo, ActionFileInfoEx
 
 LOGGER = logging.getLogger(__name__)
@@ -39,6 +51,8 @@ LOGGER = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     set_handlers(app, enabled_handler, trigger_handler=trigger_handler)
+    # The environment layer is read here, at startup, so a bad value is reported once and not on the first task.
+    _env_settings()
     if NextcloudApp().enabled_state:
         APP_ENABLED.set()
     worker = asyncio.create_task(process_tasks())
@@ -93,6 +107,123 @@ TASK_HANDLERS = {
     REDACT_PII_TASK_TYPE.id: redact_text,
 }
 
+# The declarative settings section AppAPI ships for ExApps ("ExApps Settings").
+ADMIN_SETTINGS_SECTION_ID = "declarative_settings"
+# The Nextcloud settings UI submits the form id with the app id prefix stripped, so an id
+# containing the prefix would make every real-UI save address an unregistered form and the
+# saved value would be silently dropped.
+ADMIN_SETTINGS_FORM_ID = "detection_settings"
+
+
+def admin_settings_form() -> SettingsForm:
+    """The admin-editable detection settings form (AppAPI declarative settings).
+
+    Field ids are the ``oc_appconfig_ex`` keys the pipeline resolves per task and file
+    action, so a value saved here overrides the environment variable of the same name (see
+    the config module). Field defaults show the built-in defaults: an environment override
+    stays in force until an admin saves a value, and the form cannot see the container
+    environment.
+    """
+    return SettingsForm(
+        id=ADMIN_SETTINGS_FORM_ID,
+        section_type="admin",
+        section_id=ADMIN_SETTINGS_SECTION_ID,
+        title="Text Anonymizer",
+        description=(
+            "Detection settings for every task and file action. A value saved here overrides"
+            " the environment variable of the same name and applies to work started after the"
+            " save; an empty field keeps the environment value. The defaults shown are the"
+            " built-in defaults, not the current environment overrides."
+        ),
+        fields=[
+            SettingsField(
+                id=ENV_SCORE_THRESHOLD,
+                title="Detection confidence threshold",
+                type=SettingsFieldType.NUMBER,
+                default=DEFAULT_SCORE_THRESHOLD,
+                description=(
+                    "Minimum confidence score, from 0.0 to 1.0, for an entity to be reported"
+                    " or redacted. Until a value is saved here or set in the environment,"
+                    " entities are reported regardless of confidence; the pre-filled 0.5 is"
+                    " a suggestion, not an active filter. Recognizer scores cluster in"
+                    " coarse bands (checksum-backed recognizers such as IBANs and credit"
+                    " cards near 1.0, NER models near 0.85, URLs and phone numbers around"
+                    " 0.4 to 0.6), so raising the threshold drops whole entity types at a"
+                    " step instead of weakening detections one by one."
+                ),
+            ),
+            SettingsField(
+                id=ENV_IGNORED_ENTITY_TYPES,
+                title="Ignored entity types",
+                type=SettingsFieldType.TEXT,
+                default="",
+                description=(
+                    "Comma-separated entity types that are never reported or redacted, for"
+                    " example URL,DATE_TIME. Default: none."
+                ),
+                placeholder="URL,DATE_TIME",
+            ),
+            SettingsField(
+                id=ENV_ALLOW_PATTERNS,
+                title="Allow-list patterns",
+                type=SettingsFieldType.TEXT,
+                default="",
+                description=(
+                    "Regular expressions; a detected entity is kept as-is when one matches its"
+                    " whole text, or when the entity sits inside a match of one, for example public"
+                    " company names. A pattern that is only part of a longer name keeps nothing:"
+                    " Paris keeps Paris, not Paris Hilton. The field takes one line, so join several"
+                    " patterns with | and put the longest first: Nextcloud GmbH|Nextcloud|Acme"
+                    " Corp (not with commas: a comma is part of the expression). A pattern that is"
+                    " invalid, that can match nothing (such as (Inc\\.)? or .*) or that takes too"
+                    " long on a text is ignored; the ExApp log says which. Default: none."
+                ),
+                placeholder="Nextcloud GmbH|Acme Corp",
+            ),
+        ],
+    )
+
+
+@functools.cache
+def _env_settings() -> Settings:
+    """The environment layer of the detection settings, read once per process: the environment of
+    the container does not change while the app runs. An invalid value falls back to the
+    default of its setting with a warning, instead of failing every task."""
+    return Settings.from_env()
+
+
+def _resolve_settings(records: Iterable[Any]) -> Settings:
+    """Detection settings in force: the environment values with the admin-saved appconfig ``records``
+    (what ``appconfig_ex.get_values`` returns) layered on top; the built-in defaults when nothing
+    is set, which the pipeline leaves the detections alone for."""
+    return apply_admin_config(_env_settings(), {record.key: record.value for record in records})
+
+
+def _environment_settings(error: Exception) -> Settings:
+    """The environment values alone, for when the admin-saved appconfig could not be read."""
+    LOGGER.warning("Admin detection settings could not be read, environment values stay in force: %s", error)
+    return _env_settings()
+
+
+async def _resolve_task_settings(nc: AsyncNextcloudApp) -> Settings:
+    """Detection settings for one task; a failed server read keeps the environment values."""
+    try:
+        records = await nc.appconfig_ex.get_values(list(ADMIN_CONFIG_KEYS))
+    except Exception as e:
+        return _environment_settings(e)
+    return _resolve_settings(records)
+
+
+def _resolve_action_settings(nc: NextcloudApp) -> Settings:
+    """Detection settings for a Files action, through the synchronous client; a failed server read keeps the
+    environment values."""
+    try:
+        records = nc.appconfig_ex.get_values(list(ADMIN_CONFIG_KEYS))
+    except Exception as e:
+        return _environment_settings(e)
+    return _resolve_settings(records)
+
+
 # Set by `enabled_handler`, which runs in a worker thread.
 APP_ENABLED = threading.Event()
 # Set when Nextcloud announces a new task (Nextcloud 33+) and on shutdown.
@@ -126,8 +257,9 @@ async def process_task(nc: AsyncNextcloudApp, task: dict[str, Any]) -> None:
 
     try:
         handler = TASK_HANDLERS[task["type"]]
+        settings = await _resolve_task_settings(nc)
         # Presidio is CPU-bound, so it runs in a worker thread to keep the event loop responsive.
-        output = await asyncio.to_thread(handler, task["input"]["input"], on_progress=on_progress)
+        output = await asyncio.to_thread(handler, task["input"]["input"], on_progress=on_progress, settings=settings)
     except Exception as e:
         await nc.log(LogLvl.ERROR, f"Failed to process task {task['id']}: {e}")
         await nc.providers.task_processing.report_result(
@@ -209,7 +341,8 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
             nc.notifications.create(f"Could not redact {node.name}", "The file is not a UTF-8 encoded text file.")
             return
         copy_path = redacted_copy_path(nc, node.user_path)
-        nc.files.upload(copy_path, redact_text(text))
+        redacted = redact_text(text, settings=_resolve_action_settings(nc))
+        nc.files.upload(copy_path, redacted)
         nc.notifications.create(f"Redacted copy of {node.name} saved as {posixpath.basename(copy_path)}")
     except Exception as e:
         nc.log(LogLvl.ERROR, f"Failed to redact file {file_info.fileId}: {e}")
@@ -249,6 +382,9 @@ def enabled_handler(enabled: bool, nc: NextcloudApp) -> str:
                 icon="img/icon.svg",
                 order=REDACT_FILE_ACTION_ORDER,
             )
+            # Registering the form on every enable also refreshes its schema after upgrades
+            # (a re-registration edits the existing form in place).
+            nc.ui.settings.register_form(admin_settings_form())
             APP_ENABLED.set()
         else:
             APP_ENABLED.clear()
