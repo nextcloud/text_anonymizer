@@ -4,12 +4,16 @@
 """What an allow-list pattern keeps: a detection whose whole text it matches, or one inside its match in the text."""
 
 import logging
+import random
+import time
 
 import pytest
+import regex
 from presidio_analyzer import RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
 
 import anonymizer
+import config
 from config import ENV_ALLOW_PATTERNS, Settings, filter_results, parse_allow_patterns
 
 LOGGER_NAME = "text_anonymizer.config"
@@ -38,9 +42,41 @@ def engines(monkeypatch):
     return install
 
 
+LINE = "Anna Meyer grew up in Berlin.\n"
+
+
 def _result(entity_type, text, value, start=None):
     start = text.index(value) if start is None else start
     return RecognizerResult(entity_type, start, start + len(value), 0.85)
+
+
+def _long_text(lines):
+    """``lines`` lines of ``LINE``, with a detection of "Anna Meyer" and one of "Berlin" per line."""
+    text = LINE * lines
+    results = []
+    for index in range(lines):
+        offset = index * len(LINE)
+        for entity_type, value in (("PERSON", "Anna Meyer"), ("LOCATION", "Berlin")):
+            start = offset + LINE.index(value)
+            results.append(_result(entity_type, text, value, start))
+    return text, results
+
+
+def _kept_by_scanning(pattern, results, text):
+    """The rule of the allow-list followed to the letter: kept when the pattern matches the whole text of the
+    detection, or that text widened to word boundaries, or when the detection lies inside a match of the
+    pattern in the text, looked for among every match."""
+    regions = [match.span() for match in pattern.finditer(text) if match.end() > match.start()]
+    kept = set()
+    for index, result in enumerate(results):
+        start, end = config._name_bounds(text, result.start, result.end)
+        if end <= start:
+            continue
+        if pattern.fullmatch(text[start:end]) is not None or pattern.fullmatch(config._widened_span(text, start, end)):
+            kept.add(index)
+        elif any(region_start <= start and end <= region_end for region_start, region_end in regions):
+            kept.add(index)
+    return kept
 
 
 @pytest.mark.parametrize(
@@ -168,3 +204,37 @@ def test_a_value_saved_with_an_alternation_is_one_pattern():
 def test_line_breaks_are_still_separators_for_the_environment_variable():
     sources = tuple(source for source, _ in parse_allow_patterns("Nextcloud GmbH\nAcme Corp\n"))
     assert sources == ("Nextcloud GmbH", "Acme Corp")
+
+
+def test_a_literal_pattern_keeps_its_detections_on_a_long_text(caplog):
+    """The maintainer's case: a 230 KB text with 15,000 detections and the pattern Berlin.
+
+    For every detection that the two whole-text matches did not keep, the lookup went through all the
+    regions of the pattern, 7,500 x 7,500 times here, until the budget ran out and nothing was kept.
+    """
+    text, results = _long_text(7500)
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        started = time.perf_counter()
+        assert filter_results(results, text, Settings(allow_patterns=("Berlin",))) == results[0::2]
+        assert time.perf_counter() - started < 1.0
+    assert caplog.text == ""
+
+
+def test_the_enclosing_region_is_found_as_by_looking_through_every_one():
+    """The regions of a pattern do not overlap and come in order, so the one with the greatest start at or
+    before a detection is the only one that can enclose it. That lookup must answer as a look through every
+    region does, whatever the pattern and the detections."""
+    shapes = ["a", "ab", "a+?", "a+?b*", r"(?=a)|ab", r"\b|ab", r"(?<=a)b|ab", "a(?:b|)a", r"^a|b$", r"\ba\b", "b+a?"]
+    generator = random.Random(31)
+    for _ in range(300):
+        pattern = regex.compile(generator.choice(shapes))
+        text = "".join(generator.choice("aab ") for _ in range(generator.randrange(0, 14)))
+        results = []
+        for _ in range(generator.randrange(0, 6)):
+            start = generator.randrange(0, len(text) + 1)
+            results.append(RecognizerResult("PERSON", start, start + generator.randrange(0, 4), 0.85))
+        assert config._allow_listed(pattern, results, text) == _kept_by_scanning(pattern, results, text), (
+            pattern.pattern,
+            text,
+            [(result.start, result.end) for result in results],
+        )

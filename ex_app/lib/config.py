@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import time
+from bisect import bisect_right
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -31,10 +32,19 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger("text_anonymizer.config")
 
-#: Wall-clock seconds one allow-list pattern may spend on one analysis. A sound pattern needs
-#: microseconds there; one that needs more, such as a quantified group that backtracks on long
-#: text, is ignored for that analysis, so its entities are treated as not allow-listed.
+#: Wall-clock seconds one allow-list pattern may spend on one analysis of a short text. A sound
+#: pattern needs microseconds there; one that needs more, such as a quantified group that
+#: backtracks on long text, is ignored for that analysis, so its entities are treated as not
+#: allow-listed.
 ALLOW_PATTERN_TIME_BUDGET = 0.25
+
+#: What that budget grows by per character of the text: the engine scans the whole text once,
+#: close to 2 µs a character for an alternation of five hundred names, and a long text has many
+#: detections to match. The analysis itself takes about 20 µs a character.
+ALLOW_PATTERN_SECONDS_PER_CHARACTER = 1e-5
+
+#: What the budget of one pattern on one analysis never exceeds, whatever the length of the text.
+ALLOW_PATTERN_TIME_CAP = 5.0
 
 #: Allow-list patterns that ran out of time, so that the warning is logged once per process.
 _TIMED_OUT_PATTERNS: set[str] = set()
@@ -234,25 +244,32 @@ def _widened_span(text: str, start: int, end: int) -> str:
     return text[start:end]
 
 
-def _warn_timed_out(source: str) -> None:
-    """Log, once per process, that ``source`` needs more time than the budget allows."""
+def _time_budget(text: str) -> float:
+    """Seconds one allow-list pattern may spend on ``text``: :data:`ALLOW_PATTERN_TIME_BUDGET` for a
+    short text, :data:`ALLOW_PATTERN_SECONDS_PER_CHARACTER` more per character, and
+    :data:`ALLOW_PATTERN_TIME_CAP` at the most."""
+    return min(ALLOW_PATTERN_TIME_CAP, ALLOW_PATTERN_TIME_BUDGET + ALLOW_PATTERN_SECONDS_PER_CHARACTER * len(text))
+
+
+def _warn_timed_out(source: str, budget: float) -> None:
+    """Log, once per process, that ``source`` needs more time than the ``budget`` allows."""
     if source not in _TIMED_OUT_PATTERNS:
         _TIMED_OUT_PATTERNS.add(source)
         LOGGER.warning(
             "Ignoring allow-list pattern %r where it needs more than %.2f s; a quantified group in it may backtrack",
             source,
-            ALLOW_PATTERN_TIME_BUDGET,
+            budget,
         )
 
 
 def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text: str) -> set[int]:
     """The indexes of the ``results`` that ``pattern`` keeps as-is.
 
-    Raises ``TimeoutError`` once the pattern has spent :data:`ALLOW_PATTERN_TIME_BUDGET` on
-    this call, so the caller drops every verdict of the pattern at once instead of keeping the
+    Raises ``TimeoutError`` once the pattern has spent its time budget (see :func:`_time_budget`)
+    on this call, so the caller drops every verdict of the pattern at once instead of keeping the
     entities it had matched before running out of time.
     """
-    deadline = time.perf_counter() + ALLOW_PATTERN_TIME_BUDGET
+    deadline = time.perf_counter() + _time_budget(text)
 
     def seconds_left() -> float:
         left = deadline - time.perf_counter()
@@ -260,11 +277,15 @@ def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text:
             raise TimeoutError
         return left
 
+    # The engine finds the matches from left to right and never inside the one before, so the
+    # regions are in the order of their start and do not overlap; (?r), which would reverse that,
+    # is the engine's own syntax and re refuses the pattern before it comes here.
     regions = []
     for match in pattern.finditer(text, timeout=seconds_left()):
         if match.end() > match.start():
             regions.append(match.span())
         seconds_left()
+    starts = [start for start, _ in regions]
     listed = set()
     for index, result in enumerate(results):
         start, end = _name_bounds(text, result.start, result.end)
@@ -276,8 +297,12 @@ def _allow_listed(pattern: regex.Pattern, results: list[RecognizerResult], text:
             listed.add(index)
         elif pattern.fullmatch(widened, timeout=seconds_left()) is not None:
             listed.add(index)
-        elif any(region_start <= start and end <= region_end for region_start, region_end in regions):
-            listed.add(index)
+        else:
+            # The region with the greatest start at or before the detection is the only one that
+            # can enclose it; a binary search finds it whatever the number of regions.
+            enclosing = bisect_right(starts, start) - 1
+            if enclosing >= 0 and end <= regions[enclosing][1]:
+                listed.add(index)
     return listed
 
 
@@ -295,8 +320,9 @@ def filter_results(results: list[RecognizerResult], text: str, settings: Setting
     a detector adds to a name is not part of it. A pattern that matches only part of a
     longer name does not keep that name.
 
-    Each pattern gets :data:`ALLOW_PATTERN_TIME_BUDGET` per call; one that runs out of it
-    is ignored for the whole call, so no administrator's pattern can hold the task worker.
+    Each pattern gets a time budget per call, :data:`ALLOW_PATTERN_TIME_BUDGET` for a short
+    text and more for a long one (see :func:`_time_budget`); a pattern that runs out of it is
+    ignored for the whole call, so no administrator's pattern can hold the task worker.
     """
     kept = []
     for result in results:
@@ -312,5 +338,5 @@ def filter_results(results: list[RecognizerResult], text: str, settings: Setting
         try:
             suppressed |= _allow_listed(pattern, kept, text)
         except TimeoutError:
-            _warn_timed_out(source)
+            _warn_timed_out(source, _time_budget(text))
     return [result for index, result in enumerate(kept) if index not in suppressed]

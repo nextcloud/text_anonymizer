@@ -5,6 +5,7 @@
 
 import inspect
 import logging
+import random
 import re
 import time
 
@@ -35,13 +36,14 @@ def test_no_pattern_holds_the_worker(pattern, text):
     """The shapes that never end answer within the budget and leave the entity as not allow-listed."""
     started = time.perf_counter()
     kept = filter_results([_result(0, len(text))], text, Settings(allow_patterns=(pattern,)))
-    assert time.perf_counter() - started < config.ALLOW_PATTERN_TIME_BUDGET * 4
+    assert time.perf_counter() - started < config._time_budget(text) * 4
     assert kept == [_result(0, len(text))]
 
 
 def test_a_pattern_that_runs_out_of_time_is_dropped_whole_with_one_warning(monkeypatch, caplog):
     """No verdict of the pattern survives, and the pattern is warned about once per process."""
     monkeypatch.setattr(config, "ALLOW_PATTERN_TIME_BUDGET", 0.0)
+    monkeypatch.setattr(config, "ALLOW_PATTERN_SECONDS_PER_CHARACTER", 0.0)
     config._TIMED_OUT_PATTERNS.clear()
     text = "Anna Meyer works in Berlin."
     results = [_result(0, 10), _result(20, 26)]
@@ -123,3 +125,28 @@ def test_no_private_module_of_re_is_read():
     source = inspect.getsource(config)
     assert "re._parser" not in source
     assert "_sre_parse" not in source
+
+
+def test_the_budget_grows_with_the_text_and_stops_at_its_cap():
+    assert config._time_budget("") == config.ALLOW_PATTERN_TIME_BUDGET
+    assert config._time_budget("x" * 100_000) == pytest.approx(config.ALLOW_PATTERN_TIME_BUDGET + 1.0)
+    assert config._time_budget("x" * 10_000_000) == config.ALLOW_PATTERN_TIME_CAP
+
+
+def test_a_sound_pattern_gets_the_time_a_long_text_needs(monkeypatch):
+    """A literal needs tens of milliseconds on a long text with many detections: with a budget that does not
+    grow with the text it is skipped there and all the names it covers are redacted."""
+    monkeypatch.setattr(config, "ALLOW_PATTERN_TIME_BUDGET", 0.0)
+    config._TIMED_OUT_PATTERNS.clear()
+    text = "Anna Meyer grew up in Berlin.\n" * 10_000
+    results = [_result(match.start(), match.end()) for match in re.finditer("Berlin", text)]
+    assert filter_results(results, text, Settings(allow_patterns=("Berlin",))) == []
+    assert config._TIMED_OUT_PATTERNS == set()
+
+
+def test_a_pattern_of_the_engine_alone_is_refused_by_re(caplog):
+    """(?r) searches from the end, so the matches would not come in order; re does not know the flag."""
+    assert regex.compile(r"(?r)Berlin").search("Berlin") is not None
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        assert parse_allow_patterns(r"(?r)Berlin") == ()
+    assert "Ignoring invalid allow-list pattern '(?r)Berlin'" in caplog.text
