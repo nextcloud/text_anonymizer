@@ -56,6 +56,8 @@ def test_redact_file_uploads_redacted_copy(monkeypatch):
     node.user_path = "/dir/notes.txt"
     node.info.size = 10
     nc.files.download.return_value = b"Hi John"
+    node.etag_unquoted = "etag-of-the-original"  # the record keeps the etag the copy was made from
+    nc.files.upload.return_value.file_id = "00000099ocinstance"  # the upload answers with the full file id of the copy
 
     main.redact_file(nc, make_file_info())
 

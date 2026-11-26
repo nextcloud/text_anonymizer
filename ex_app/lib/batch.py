@@ -3,13 +3,14 @@
 
 """Folder-level batch redaction: recursive text file collection, size and MIME guards, per-file results."""
 
+import json
 import logging
 import os
 import posixpath
 import re
 import threading
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 
 from anonymizer import redact_text
@@ -24,8 +25,9 @@ MAX_FILE_BYTES_ENV = "TEXT_ANONYMIZER_MAX_FILE_BYTES"
 
 REDACTED_SUFFIX_RE = re.compile(r" \(redacted(?: \d+)?\)$")
 
-# Every redacted copy remembers the etag its original had when the copy was made, in the key/value store of the
-# ExApp in Nextcloud (``nc.appconfig_ex``): one record per original, under ``RECORD_KEY_PREFIX`` and its file id.
+# Every original remembers the etag it had when its redacted copies were made and which files those copies are, in the
+# key/value store of the ExApp in Nextcloud (``nc.appconfig_ex``): one record per original, under
+# ``RECORD_KEY_PREFIX`` and its file id.
 RECORD_KEY_PREFIX = "redacted_copy_etag/"
 RECORDS_PER_REQUEST = 200
 
@@ -157,38 +159,56 @@ def redacted_copies_by_original(nodes: Iterable[FsNode]) -> dict[str, list[FsNod
     return copies
 
 
-def recorded_etags(nc: NextcloudApp, file_ids: Iterable[int]) -> dict[int, str]:
-    """The etags remembered for the originals ``file_ids``, by file id; an original without a record is left out."""
-    keys = [RECORD_KEY_PREFIX + str(file_id) for file_id in file_ids]
-    recorded: dict[int, str] = {}
+@dataclass(frozen=True)
+class CopyRecord:
+    """What is remembered about the redacted copies of one original."""
+
+    etag: str
+    """The etag the original had when its copies were made."""
+    copy_ids: tuple[str, ...]
+    """The full file ids (``FsNode.file_id``) of the copies made at that etag, wherever they are."""
+
+
+def record_key(node: FsNode) -> str:
+    return RECORD_KEY_PREFIX + str(node.info.fileid)
+
+
+def copy_records(nc: NextcloudApp, nodes: Iterable[FsNode]) -> dict[int, CopyRecord]:
+    """The records of ``nodes``, by file id; a file without a record, or with one that cannot be read, is left out."""
+    keys = [record_key(node) for node in nodes]
+    records: dict[int, CopyRecord] = {}
     for start in range(0, len(keys), RECORDS_PER_REQUEST):
         for record in nc.appconfig_ex.get_values(keys[start : start + RECORDS_PER_REQUEST]):
-            recorded[int(record.key[len(RECORD_KEY_PREFIX) :])] = record.value
-    return recorded
+            with suppress(ValueError, KeyError, TypeError):
+                data = json.loads(record.value)
+                records[int(record.key[len(RECORD_KEY_PREFIX) :])] = CopyRecord(
+                    data["etag"], tuple(str(copy_id) for copy_id in data["copies"])
+                )
+    return records
 
 
-def redacted_copy_is_fresh(
-    nc: NextcloudApp, node: FsNode, copies: dict[str, list[FsNode]] | None = None, recorded: dict[int, str] | None = None
-) -> bool:
+def remember_copy(nc: NextcloudApp, node: FsNode, copy: FsNode, record: CopyRecord | None) -> None:
+    """Remember ``copy`` as made from the content ``node`` has now, next to the copies made at that etag already."""
+    made = record.copy_ids if record is not None and record.etag == node.etag_unquoted else ()
+    value = json.dumps({"etag": node.etag_unquoted, "copies": [*made, copy.file_id]})
+    nc.appconfig_ex.set_value(record_key(node), value)
+
+
+def redacted_copy_is_fresh(node: FsNode, copies: dict[str, list[FsNode]], record: CopyRecord | None) -> bool:
     """Whether ``node`` is already redacted and up to date, so an action on it is a no-op.
 
-    A redacted copy is never redacted again, whatever its age. A regular file is fresh when a redacted copy of
-    it exists and the etag remembered for it is the etag it has now, i.e. when a copy was made from the content
-    the file still has. The modification time cannot tell that: a restored version or a file that a sync client
-    uploaded with its old local timestamp changes the content and leaves the file no newer than its copy.
-
-    ``copies`` is the index of a folder listing (see ``redacted_copies_by_original``); without it, the folder of
-    ``node`` is listed. ``recorded`` is what ``recorded_etags`` returned; without it, the record is read.
+    A redacted copy is never redacted again, whatever its age. A regular file is fresh when one of the redacted copies
+    of it in ``copies`` (the index of the listing of its folder, see ``redacted_copies_by_original``) is among those
+    that ``record`` names, i.e. a copy the app made, and ``record`` carries the etag the file has now, i.e. a copy
+    was made from the content the file still has. The modification time cannot tell that: a restored version or a
+    file that a sync client uploaded with its old local timestamp changes the content and leaves the file no newer
+    than its copy. ``record`` is what ``copy_records`` returned for the file; ``None`` when nothing is remembered.
     """
     if is_redacted_copy(node.user_path):
         return True
-    if copies is None:
-        copies = redacted_copies_by_original(nc.files.listdir(posixpath.dirname(node.user_path)))
-    if not copies.get(node.user_path):
+    if record is None or not node.etag_unquoted or record.etag != node.etag_unquoted:
         return False
-    if recorded is None:
-        recorded = recorded_etags(nc, [node.info.fileid])
-    return bool(node.etag_unquoted) and recorded.get(node.info.fileid) == node.etag_unquoted
+    return any(copy.file_id in record.copy_ids for copy in copies.get(node.user_path, []))
 
 
 @dataclass
@@ -297,28 +317,39 @@ def _file_lock(file_id: int) -> Iterator[None]:
 
 
 def redact_file_copy(
-    nc: NextcloudApp, node: FsNode, redact: RedactFn, copies: dict[str, list[FsNode]] | None = None
+    nc: NextcloudApp,
+    node: FsNode,
+    redact: RedactFn,
+    copies: dict[str, list[FsNode]] | None = None,
+    record: CopyRecord | None = None,
 ) -> str | None:
     """Write a redacted copy of ``node`` next to the original and return the copy's path.
 
     Returns ``None`` when a copy is up to date by then. The check runs under the lock of the original, because
-    another action may have written the copy since ``node`` was found: against a new listing, or, when
-    ``copies`` is the index of the listing that found ``node``, only if the first free path is no longer the one
-    that index announces, i.e. if a copy appeared since.
+    another action may have written the copy since ``node`` was found: against a new listing and a new record,
+    or, when ``copies`` and ``record`` are the index of the listing that found ``node`` and what ``copy_records``
+    returned then, only if the first free path is no longer the one that index announces, i.e. if a copy appeared
+    since. ``record`` is also the one the new copy is added to.
     """
     with _file_lock(node.info.fileid):
         if copies is None:
-            if redacted_copy_is_fresh(nc, node):
+            copies = redacted_copies_by_original(nc.files.listdir(posixpath.dirname(node.user_path)))
+            record = copy_records(nc, [node]).get(node.info.fileid)
+            if redacted_copy_is_fresh(node, copies, record):
                 return None
             copy_path = redacted_copy_path(nc, node.user_path)
         else:
             copy_path = redacted_copy_path(nc, node.user_path)
             taken = {copy.user_path for copy in copies.get(node.user_path, [])}
-            if copy_path != _free_copy_path(node.user_path, taken.__contains__) and redacted_copy_is_fresh(nc, node):
-                return None
+            if copy_path != _free_copy_path(node.user_path, taken.__contains__):
+                # A copy appeared since the listing: decide again, on the folder and the record as they are now.
+                copies = redacted_copies_by_original(nc.files.listdir(posixpath.dirname(node.user_path)))
+                record = copy_records(nc, [node]).get(node.info.fileid)
+                if redacted_copy_is_fresh(node, copies, record):
+                    return None
         text = nc.files.download(node).decode("utf-8")
-        nc.files.upload(copy_path, redact(text))
-        nc.appconfig_ex.set_value(RECORD_KEY_PREFIX + str(node.info.fileid), node.etag_unquoted)
+        copy = nc.files.upload(copy_path, redact(text))
+        remember_copy(nc, node, copy, record)
         return copy_path
 
 
@@ -342,7 +373,16 @@ def redact_folder(
     limit = max_file_bytes() if max_bytes is None else max_bytes
     files, oversize, copies, unreadable = collect_text_files(nc, folder, limit)
     report = BatchReport(folder_name=folder.name, results=oversize, unreadable_folders=unreadable)
-    recorded: dict[int, str] | None = None
+    # Every original needs its record, also one with no copy in this folder: another user may hold a current copy.
+    try:
+        records = copy_records(nc, [node for node in files if not is_redacted_copy(node.user_path)])
+    except NextcloudException as e:
+        # Without the records a file with a copy can be neither redacted again nor taken for done.
+        records = {}
+        for node in files:
+            if node.user_path in copies and not is_redacted_copy(node.user_path):
+                report.results.append(FileResult(node, STATUS_FAILED, str(e) or e.__class__.__name__))
+        files = [node for node in files if node.user_path not in copies]
     for index, node in enumerate(files, 1):
         if on_progress is not None:
             on_progress(index, len(files), node.name)
@@ -350,14 +390,10 @@ def redact_folder(
             if is_redacted_copy(node.user_path):
                 report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is never redacted again"))
                 continue
-            if node.user_path in copies:
-                if recorded is None:
-                    # Only a file with a copy can be up to date, so only those need their remembered etags.
-                    recorded = recorded_etags(nc, [node.info.fileid for node in files if node.user_path in copies])
-                if redacted_copy_is_fresh(nc, node, copies, recorded):
-                    report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
-                    continue
-            detail = redact_file_copy(nc, node, redact, copies)
+            if redacted_copy_is_fresh(node, copies, records.get(node.info.fileid)):
+                report.results.append(FileResult(node, STATUS_SKIPPED, "a redacted copy is already up to date"))
+                continue
+            detail = redact_file_copy(nc, node, redact, copies, records.get(node.info.fileid))
         except UnicodeDecodeError:
             report.results.append(FileResult(node, STATUS_FAILED, "not a UTF-8 encoded text file"))
         except Exception as e:

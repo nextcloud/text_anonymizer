@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import json
 import logging
 import logging.handlers
 import posixpath
@@ -69,24 +70,37 @@ class FakeFiles:
 
     def add_dir(self, user_path: str, permissions: str = "RGDNVCK") -> FsNode:
         dir_path = user_path.rstrip("/") + "/"
-        node = FsNode(f"files/admin/{dir_path}", fileid=self._next_id, mimetype="httpd/unix-directory", permissions=permissions)
+        node = FsNode(
+            f"files/admin/{dir_path}",
+            fileid=self._next_id,
+            file_id=self._full_id(self._next_id),
+            mimetype="httpd/unix-directory",
+            permissions=permissions,
+        )
         self._next_id += 1
         self.nodes[dir_path] = node
         return node
 
+    def _full_id(self, file_id: int) -> str:
+        """The full file id (``oc:id``) of a file: its id and the id of the storage, as a server gives it."""
+        return f"{file_id:08d}ocinstance"
+
     def add_file(self, user_path: str, content: bytes, mimetype: str, last_modified=None, etag=None) -> FsNode:
-        """Add a file; every node gets its own etag, as a storage gives a new one to every write."""
+        """Add a file, or write into one that exists: a new etag either way; a file that exists keeps its file ids."""
         self._next_etag += 1
+        existing = self.nodes.get(user_path)
         node = FsNode(
             f"files/admin/{user_path}",
-            fileid=self._next_id,
+            fileid=existing.info.fileid if existing else self._next_id,
+            file_id=existing.file_id if existing else self._full_id(self._next_id),
             mimetype=mimetype,
             size=len(content),
             content_length=len(content),
             last_modified=last_modified or self.ADDED_AT,
             etag=etag or f'"e{self._next_etag}"',
         )
-        self._next_id += 1
+        if existing is None:
+            self._next_id += 1
         self.nodes[user_path] = node
         self.contents[user_path] = content
         return node
@@ -1068,9 +1082,12 @@ def test_edited_original_gets_a_new_copy_and_the_old_one_stays(monkeypatch):
     assert sorted(nc.files.uploads) == ["docs/a (redacted 2).txt", "docs/a (redacted).txt"]
 
 
-def remember(nc: FakeNc, node: FsNode) -> None:
-    """Remember for ``node`` the etag it has now, as the redaction of a copy of it does."""
-    nc.appconfig_ex.values[batch.RECORD_KEY_PREFIX + str(node.info.fileid)] = node.etag_unquoted
+def remember(nc: FakeNc, original: FsNode, *copies: FsNode) -> None:
+    """Remember ``copies`` as made from the content ``original`` has now, as the app does when it writes them."""
+    record = None
+    for copy in copies:
+        batch.remember_copy(nc, original, copy, record)
+        record = batch.copy_records(nc, [original])[original.info.fileid]
 
 
 def _copies_tree():
@@ -1085,8 +1102,38 @@ def _copies_tree():
             ("docs/a (redacted 2).txt", b"current copy", "text/plain", current_at),
         ]
     )
-    remember(nc, nc.files.nodes["docs/a.txt"])
+    remember(nc, nc.files.nodes["docs/a.txt"], nc.files.nodes["docs/a (redacted 2).txt"])
     return nc, docs
+
+
+def edit(nc: FakeNc, user_path: str, content: bytes, last_modified=None) -> FsNode:
+    """The file at ``user_path`` is written: a new etag and the same file id, as every write does.
+
+    See ``FakeFiles.add_file``: a double keeps the file ids of a file it is written into.
+    """
+    return nc.files.add_file(user_path, content, "text/plain", last_modified)
+
+
+def shared_file(owner: FakeNc, original: FsNode, sharee: FakeNc, path: str) -> FsNode:
+    """``original`` as ``sharee`` sees it through a single-file share, at ``path`` in his root.
+
+    The same file ids and etag. The records are those of the file, whoever redacts it: both doubles share the store.
+    """
+    sharee.appconfig_ex = owner.appconfig_ex
+    sharee.files.add_dir(posixpath.dirname(path))
+    node = FsNode(
+        f"files/bob/{path}",
+        fileid=original.info.fileid,
+        file_id=original.file_id,
+        mimetype="text/plain",
+        size=original.info.size,
+        content_length=original.info.size,
+        last_modified=original.info.last_modified,
+        etag=original.etag,
+    )
+    sharee.files.nodes[path] = node
+    sharee.files.contents[path] = owner.files.contents[original.user_path]
+    return node
 
 
 def _never_called(text: str) -> str:
@@ -1209,18 +1256,19 @@ def test_the_copy_remembers_the_etag_its_original_had_in_the_listing():
     nc, docs, original = _redacted_once()
     [recorded] = nc.appconfig_ex.values.values()
     assert list(nc.appconfig_ex.values) == [batch.RECORD_KEY_PREFIX + str(original.info.fileid)]
-    assert recorded == original.etag_unquoted
+    copy_id = nc.files.nodes["docs/a (redacted).txt"].file_id
+    assert json.loads(recorded) == {"etag": original.etag_unquoted, "copies": [copy_id]}
 
 
-def test_a_repeat_reads_the_records_of_a_folder_in_one_request_and_no_file():
-    """An unchanged folder costs one request for all its records and no download."""
+def test_a_run_reads_the_records_of_its_folder_in_one_request_and_a_repeat_downloads_nothing():
+    """One request carries the records of a folder, whatever its size: 200 keys per request, none per file."""
     nc = FakeNc()
     docs = nc.files.add_dir("docs")
     originals = [nc.files.add_file(f"docs/{number}.txt", b"one", "text/plain") for number in range(5)]
     keys = [batch.RECORD_KEY_PREFIX + str(node.info.fileid) for node in originals]
     redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
-    # The first run finds no copy, so it reads no record; it writes one per file.
-    assert nc.appconfig_ex.calls == [("set_value", key) for key in keys]
+    # The first run reads the records too: also where it sees no copy, another user may hold a current one.
+    assert nc.appconfig_ex.calls == [("get_values", keys), *[("set_value", key) for key in keys]]
     nc.appconfig_ex.calls.clear()
     nc.files.downloads.clear()
     report = redact_folder(nc, docs, redact=_never_called, max_bytes=NO_LIMIT)
@@ -1250,6 +1298,165 @@ def test_single_file_action_is_a_no_op_when_the_copy_is_fresh(monkeypatch):
     assert nc.files.downloads == ["notes.txt"]
     assert list(nc.files.uploads) == ["notes (redacted).txt"]
     assert nc.notifications.created[-1] == ("A redacted copy of notes.txt is already up to date", "")
+
+
+def test_a_copy_of_another_user_does_not_pass_the_owners_stale_copy(monkeypatch):
+    """A single-file share: the sharee's copy lands in his root; it must not make the owner's old copy current."""
+    owner = FakeNc()
+    docs = owner.files.add_dir("docs")
+    owner.files.add_file("docs/notes.txt", b"one", "text/plain")
+    redact_folder(owner, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    edited = edit(owner, "docs/notes.txt", b"one edited", FakeFiles.UPLOADED_AT + datetime.timedelta(hours=1))
+    sharee = FakeNc()
+    shared = shared_file(owner, edited, sharee, "inbox/notes.txt")
+    monkeypatch.setattr(main, "redact_text", fake_redact)
+    main.redact_file(sharee, action_info(shared, "file"))
+    assert list(sharee.files.uploads) == ["inbox/notes (redacted).txt"]
+
+    owner.files.downloads.clear()
+    report = redact_folder(owner, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    # The owner's copy is of the content before the edit: she gets a new one, and the sharee's copy stays current.
+    assert [result.detail for result in report.redacted] == ["docs/notes (redacted 2).txt"]
+    assert owner.files.uploads["docs/notes (redacted 2).txt"] == fake_redact("one edited").encode()
+    main.redact_file(sharee, action_info(shared, "file"))
+    assert list(sharee.files.uploads) == ["inbox/notes (redacted).txt"]
+    assert sharee.notifications.created[-1] == ("A redacted copy of notes.txt is already up to date", "")
+
+
+def test_the_copies_of_two_users_of_one_shared_file_are_both_up_to_date(monkeypatch):
+    """Each user's action after the other's must not write a copy of a file that did not change."""
+    owner = FakeNc()
+    docs = owner.files.add_dir("docs")
+    original = owner.files.add_file("docs/notes.txt", b"one", "text/plain")
+    sharee = FakeNc()
+    shared = shared_file(owner, original, sharee, "notes.txt")
+    monkeypatch.setattr(main, "redact_text", fake_redact)
+    for _round in (1, 2):
+        redact_folder(owner, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+        main.redact_file(sharee, action_info(shared, "file"))
+    assert list(owner.files.uploads) == ["docs/notes (redacted).txt"]
+    assert list(sharee.files.uploads) == ["notes (redacted).txt"]
+    assert sharee.notifications.created[-1] == ("A redacted copy of notes.txt is already up to date", "")
+    # After an edit both need a new copy, and both get one.
+    edit(owner, "docs/notes.txt", b"one edited")
+    shared = shared_file(owner, owner.files.nodes["docs/notes.txt"], sharee, "notes.txt")
+    redact_folder(owner, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    main.redact_file(sharee, action_info(shared, "file"))
+    assert sorted(owner.files.uploads) == ["docs/notes (redacted 2).txt", "docs/notes (redacted).txt"]
+    assert sorted(sharee.files.uploads) == ["notes (redacted 2).txt", "notes (redacted).txt"]
+
+
+def test_an_original_moved_next_to_an_older_copy_is_redacted_again():
+    """A move keeps the file id and the etag; the record names a copy that is not in the new folder."""
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs")
+    other = nc.files.add_dir("other")
+    original = nc.files.add_file("docs/notes.txt", b"new", "text/plain")
+    redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    nc.files.add_file("other/notes (redacted).txt", b"the copy of an older notes.txt", "text/plain", FakeFiles.ADDED_AT)
+    moved = FsNode(
+        "files/admin/other/notes.txt",
+        fileid=original.info.fileid,
+        file_id=original.file_id,
+        mimetype="text/plain",
+        size=3,
+        content_length=3,
+        last_modified=original.info.last_modified,
+        etag=original.etag,
+    )
+    del nc.files.nodes["docs/notes.txt"]
+    nc.files.nodes["other/notes.txt"] = moved
+    nc.files.contents["other/notes.txt"] = b"new"
+    nc.files.downloads.clear()
+
+    report = redact_folder(nc, other, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.detail for result in report.redacted] == ["other/notes (redacted 2).txt"]
+    assert nc.files.downloads == ["other/notes.txt"]
+    assert nc.files.contents["other/notes (redacted).txt"] == b"the copy of an older notes.txt"
+
+
+def test_an_original_moved_with_its_copy_stays_up_to_date():
+    """The record names the copy by its file id, which a move keeps: a moved folder is not redacted twice."""
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs")
+    original = nc.files.add_file("docs/notes.txt", b"one", "text/plain")
+    redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    copy = nc.files.nodes["docs/notes (redacted).txt"]
+    moved = nc.files.add_dir("archive")
+    for node, path in ((original, "archive/notes.txt"), (copy, "archive/notes (redacted).txt")):
+        nc.files.nodes[path] = FsNode(
+            f"files/admin/{path}",
+            fileid=node.info.fileid,
+            file_id=node.file_id,
+            mimetype=node.info.mimetype,
+            size=node.info.size,
+            content_length=node.info.size,
+            last_modified=node.info.last_modified,
+            etag=node.etag,
+        )
+        nc.files.contents[path] = nc.files.contents[node.user_path]
+        del nc.files.nodes[node.user_path]
+    assert moved is not None and copy.file_id
+    nc.files.downloads.clear()
+    for _run in (1, 2):
+        report = redact_folder(nc, moved, redact=_never_called, max_bytes=NO_LIMIT)
+        assert [result.detail for result in report.skipped] == [
+            "a redacted copy is never redacted again",
+            "a redacted copy is already up to date",
+        ]
+    assert nc.files.downloads == [] and list(nc.files.uploads) == ["docs/notes (redacted).txt"]  # the first run's only
+
+
+def test_a_hand_made_copy_in_the_place_of_the_copy_is_redacted_again():
+    """A file that merely carries the name of the copy is not the copy: it has no record."""
+    nc = FakeNc()
+    docs = nc.files.add_dir("docs")
+    original = nc.files.add_file("docs/notes.txt", b"one", "text/plain")
+    redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    del nc.files.nodes["docs/notes (redacted).txt"]
+    hand_made = nc.files.add_file("docs/notes (redacted).txt", b"written by hand", "text/plain", FakeFiles.UPLOADED_AT)
+    assert original.etag_unquoted == nc.files.nodes["docs/notes.txt"].etag_unquoted  # the original did not change
+    nc.files.downloads.clear()
+
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.detail for result in report.redacted] == ["docs/notes (redacted 2).txt"]
+    assert nc.files.contents["docs/notes (redacted).txt"] == b"written by hand" and hand_made.file_id
+
+
+def test_the_record_names_the_copies_made_at_the_etag():
+    """A copy that is made joins the record when its etag is the one remembered; another etag starts a new record."""
+    nc, docs, original = _redacted_once()
+    first = nc.files.nodes["docs/a (redacted).txt"]
+    assert json.loads(nc.appconfig_ex.values[batch.RECORD_KEY_PREFIX + str(original.info.fileid)]) == {
+        "etag": original.etag_unquoted,
+        "copies": [first.file_id],
+    }
+    del nc.files.nodes["docs/a (redacted).txt"]
+    redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    second = nc.files.nodes["docs/a (redacted).txt"]
+    assert second.file_id != first.file_id
+    assert json.loads(nc.appconfig_ex.values[batch.RECORD_KEY_PREFIX + str(original.info.fileid)]) == {
+        "etag": original.etag_unquoted,
+        "copies": [first.file_id, second.file_id],
+    }
+    edit(nc, "docs/a.txt", b"one edited")
+    redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    [value] = nc.appconfig_ex.values.values()
+    assert json.loads(value) == {
+        "etag": nc.files.nodes["docs/a.txt"].etag_unquoted,
+        "copies": [nc.files.nodes["docs/a (redacted 2).txt"].file_id],
+    }
+
+
+def test_a_record_that_cannot_be_read_does_not_count():
+    """A record of another shape, as one of an older version of the app, makes the file neither fresh nor fail."""
+    nc, docs, original = _redacted_once()
+    nc.appconfig_ex.values[batch.RECORD_KEY_PREFIX + str(original.info.fileid)] = original.etag_unquoted
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.detail for result in report.redacted] == ["docs/a (redacted 2).txt"] and report.failed == []
+    assert json.loads(nc.appconfig_ex.values[batch.RECORD_KEY_PREFIX + str(original.info.fileid)])["etag"] == (
+        original.etag_unquoted
+    )
 
 
 @contextlib.contextmanager
