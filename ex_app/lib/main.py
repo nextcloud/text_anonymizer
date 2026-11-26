@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from anonymizer import detect_pii, redact_text
+from anonymizer import contains_pii, detect_pii, redact_text
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -84,13 +84,50 @@ REDACT_PII_PROVIDER = TaskProcessingProvider(
     task_type=REDACT_PII_TASK_TYPE.id,
 )
 
+# TaskProcessing has no boolean shape type, so the result is carried as the text "true" or "false".
+CONTAINS_PII_TASK_TYPE = TaskType(
+    id="text_anonymizer:contains_pii",
+    name="Contains sensitive text?",
+    description=(
+        "Check whether a text contains personally identifiable information (PII), returning only a true/false result."
+    ),
+    input_shape=[ShapeDescriptor(name="input", description="Text to check", shape_type=ShapeType.TEXT)],
+    output_shape=[
+        ShapeDescriptor(
+            name="contains_pii",
+            description='PII detected ("true" or "false")',
+            shape_type=ShapeType.TEXT,
+        )
+    ],
+)
+CONTAINS_PII_PROVIDER = TaskProcessingProvider(
+    id=CONTAINS_PII_TASK_TYPE.id,
+    name="TextAnonymizer PII Classifier",
+    task_type=CONTAINS_PII_TASK_TYPE.id,
+)
+
+
+def handle_detect_pii(task_input: dict[str, Any], on_progress=None) -> dict[str, str]:
+    return {"output": detect_pii(task_input["input"], on_progress=on_progress)}
+
+
+def handle_contains_pii(task_input: dict[str, Any], on_progress=None) -> dict[str, str]:
+    return {"contains_pii": "true" if contains_pii(task_input["input"], on_progress=on_progress) else "false"}
+
+
+def handle_redact_pii(task_input: dict[str, Any], on_progress=None) -> dict[str, str]:
+    return {"output": redact_text(task_input["input"], on_progress=on_progress)}
+
+
 TASK_PROCESSING_PROVIDERS = [
     (DETECT_PII_PROVIDER, DETECT_PII_TASK_TYPE),
     (REDACT_PII_PROVIDER, REDACT_PII_TASK_TYPE),
+    (CONTAINS_PII_PROVIDER, CONTAINS_PII_TASK_TYPE),
 ]
 TASK_HANDLERS = {
-    DETECT_PII_TASK_TYPE.id: detect_pii,
-    REDACT_PII_TASK_TYPE.id: redact_text,
+    DETECT_PII_TASK_TYPE.id: handle_detect_pii,
+    REDACT_PII_TASK_TYPE.id: handle_redact_pii,
+    CONTAINS_PII_TASK_TYPE.id: handle_contains_pii,
 }
 
 # Set by `enabled_handler`, which runs in a worker thread.
@@ -127,14 +164,14 @@ async def process_task(nc: AsyncNextcloudApp, task: dict[str, Any]) -> None:
     try:
         handler = TASK_HANDLERS[task["type"]]
         # Presidio is CPU-bound, so it runs in a worker thread to keep the event loop responsive.
-        output = await asyncio.to_thread(handler, task["input"]["input"], on_progress=on_progress)
+        output = await asyncio.to_thread(handler, task["input"], on_progress=on_progress)
     except Exception as e:
         await nc.log(LogLvl.ERROR, f"Failed to process task {task['id']}: {e}")
         await nc.providers.task_processing.report_result(
             task["id"], error_message=str(e), user_facing_error_message="The text could not be processed."
         )
         return
-    await nc.providers.task_processing.report_result(task["id"], {"output": output})
+    await nc.providers.task_processing.report_result(task["id"], output)
 
 
 async def process_tasks() -> None:
