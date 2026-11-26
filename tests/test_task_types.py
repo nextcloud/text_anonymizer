@@ -234,10 +234,28 @@ def test_pseudonymize_mode_numbers_unique_entities(set_engines) -> None:
     output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": TEXT, "mode": "pseudonymize"})
     assert output["output"] == "<PERSON_1> met <PERSON_2> at <EMAIL_ADDRESS_1>."
     assert json.loads(output["mapping"]) == {
-        "PERSON_1": "Alice",
-        "PERSON_2": "Bob",
-        "EMAIL_ADDRESS_1": "bob@example.com",
+        "<PERSON_1>": "Alice",
+        "<PERSON_2>": "Bob",
+        "<EMAIL_ADDRESS_1>": "bob@example.com",
     }
+
+
+def restore(pseudonymized: str, mapping: dict[str, str]) -> str:
+    """Replace each key by its value, the way ``pseudonymize_text`` says the original is restored."""
+    for placeholder, value in mapping.items():
+        pseudonymized = pseudonymized.replace(placeholder, value)
+    return pseudonymized
+
+
+def test_pseudonymize_mode_keys_are_the_placeholders_of_the_text(set_engines) -> None:
+    names = ["Alice", "Bob", "Carol", "Dave", "Erin", "Frank", "Grace", "Heidi", "Ivan", "Judy", "Mallory", "Niaj"]
+    text = " ".join(f"{name} was there." for name in names)
+    set_engines([entity("PERSON", name, text) for name in names])
+    output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
+    mapping = json.loads(output["mapping"])
+
+    assert list(mapping) == [f"<PERSON_{number}>" for number in range(1, 13)]
+    assert restore(output["output"], mapping) == text
 
 
 def test_pseudonymize_mode_reuses_placeholders_for_repeated_values(set_engines) -> None:
@@ -251,7 +269,7 @@ def test_pseudonymize_mode_reuses_placeholders_for_repeated_values(set_engines) 
     )
     output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
     assert output["output"] == "<PERSON_1> met <PERSON_2>. <PERSON_1> left."
-    assert json.loads(output["mapping"]) == {"PERSON_1": "Bob", "PERSON_2": "Alice"}
+    assert json.loads(output["mapping"]) == {"<PERSON_1>": "Bob", "<PERSON_2>": "Alice"}
 
 
 def test_pseudonymize_mode_resolves_overlapping_entities(set_engines) -> None:
@@ -264,7 +282,7 @@ def test_pseudonymize_mode_resolves_overlapping_entities(set_engines) -> None:
     )
     output = main.TASK_HANDLERS["text_anonymizer:redact_pii"]({"input": text, "mode": "pseudonymize"})
     assert output["output"] == "<PERSON_1>"
-    assert json.loads(output["mapping"]) == {"PERSON_1": "John Smith"}
+    assert json.loads(output["mapping"]) == {"<PERSON_1>": "John Smith"}
 
 
 def test_pseudonymize_mode_without_pii_reports_empty_mapping(set_engines) -> None:

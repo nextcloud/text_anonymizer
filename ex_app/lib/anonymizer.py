@@ -116,7 +116,7 @@ def pseudonymize_text(
 
     Each distinct pair of entity type and value is numbered per type in order of first appearance, so the same
     value always resolves to the same placeholder. Returns the pseudonymized text and a mapping of each
-    placeholder, e.g. ``PERSON_1``, to its original value, to be kept by the data controller for
+    placeholder, e.g. ``<PERSON_1>``, to its original value, to be kept by the data controller for
     re-identification.
     """
     analyzer, anonymizer = _get_engines()
@@ -130,11 +130,11 @@ def pseudonymize_text(
         key = (item.entity_type, item.text)
         if key not in placeholders:
             counters[item.entity_type] = counters.get(item.entity_type, 0) + 1
-            placeholders[key] = f"{item.entity_type}_{counters[item.entity_type]}"
+            placeholders[key] = f"<{item.entity_type}_{counters[item.entity_type]}>"
 
     def assign(entity_type: str) -> Callable[[str], str]:
         def replace(value: str) -> str:
-            return f"<{placeholders[(entity_type, value)]}>"
+            return placeholders[(entity_type, value)]
 
         return replace
 
