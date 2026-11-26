@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from anonymizer import detect_pii, redact_text
+from anonymizer import detect_pii, download_model, engine_state, redact_text
 from fastapi import BackgroundTasks, Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,11 +22,13 @@ from nc_py_api.ex_app import (
     AppAPIAuthMiddleware,
     LogLvl,
     anc_app,
+    nc_app,
     run_app,
     set_handlers,
 )
 from nc_py_api.ex_app.providers.task_processing import (
     ShapeDescriptor,
+    ShapeEnumValue,
     ShapeType,
     TaskProcessingProvider,
     TaskType,
@@ -35,12 +37,25 @@ from nc_py_api.files import ActionFileInfo, ActionFileInfoEx
 
 LOGGER = logging.getLogger(__name__)
 
+# Optional language selector shared by both task types; English is the default.
+LANGUAGE_INPUT = ShapeDescriptor(
+    name="language",
+    description="Language of the text",
+    shape_type=ShapeType.ENUM,
+)
+LANGUAGE_ENUM_VALUES = {
+    "language": [ShapeEnumValue(name="English", value="en"), ShapeEnumValue(name="Deutsch", value="de")],
+}
+LANGUAGE_DEFAULTS = {"language": "en"}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    set_handlers(app, enabled_handler, trigger_handler=trigger_handler)
-    if NextcloudApp().enabled_state:
+    set_handlers(app, enabled_handler, default_init=False, trigger_handler=trigger_handler)
+    nc = NextcloudApp()
+    if nc.enabled_state:
         APP_ENABLED.set()
+        threading.Thread(target=resume_init, args=(nc,), daemon=True).start()
     worker = asyncio.create_task(process_tasks())
     yield
     SHUTDOWN.set()
@@ -51,6 +66,39 @@ async def lifespan(app: FastAPI):
 APP = FastAPI(lifespan=lifespan)
 APP.add_middleware(AppAPIAuthMiddleware)  # set global AppAPI authentication middleware
 APP.mount("/img", StaticFiles(directory=Path(__file__).parent.parent / "img"), name="img")
+
+
+def download_model_task(nc: NextcloudApp) -> None:
+    """Download the GLiNER model while AppAPI initialises the app, so that no task waits for it.
+
+    A failed download does not fail the installation: texts are analyzed with the spaCy detection
+    engine until the model is loaded.
+    """
+    try:
+        download_model(lambda percent: nc.set_init_status(min(int(percent), 99)))
+    except Exception as e:
+        LOGGER.warning("The GLiNER model could not be downloaded: %s", e, exc_info=True)
+    nc.set_init_status(100)
+
+
+def resume_init(nc: NextcloudApp) -> None:
+    """Finish the download of the model if a restart of the container cut the init short.
+
+    AppAPI sends its init once, at the registration or the update, so a restart during the download left the
+    app at that progress for good. On every start of an enabled app the model is checked in the storage, which
+    costs no network when it is complete, and downloaded again when it is not. The progress goes to AppAPI as
+    during the init: it enables the app at the end, and it ignores the report when the init was over already.
+    """
+    try:
+        download_model_task(nc)
+    except Exception as e:
+        LOGGER.warning("The GLiNER model could not be made ready after the restart: %s", e, exc_info=True)
+
+
+@APP.post("/init")
+async def init(background_tasks: BackgroundTasks, nc: Annotated[NextcloudApp, Depends(nc_app)]):
+    background_tasks.add_task(download_model_task, nc)
+    return JSONResponse(content={})
 
 DETECT_PII_TASK_TYPE = TaskType(
     id="text_anonymizer:detect_pii",
@@ -69,6 +117,9 @@ DETECT_PII_PROVIDER = TaskProcessingProvider(
     id=DETECT_PII_TASK_TYPE.id,
     name="TextAnonymizer PII Detector",
     task_type=DETECT_PII_TASK_TYPE.id,
+    optional_input_shape=[LANGUAGE_INPUT],
+    optional_input_shape_enum_values=LANGUAGE_ENUM_VALUES,
+    optional_input_shape_defaults=LANGUAGE_DEFAULTS,
 )
 
 REDACT_PII_TASK_TYPE = TaskType(
@@ -82,15 +133,40 @@ REDACT_PII_PROVIDER = TaskProcessingProvider(
     id=REDACT_PII_TASK_TYPE.id,
     name="TextAnonymizer PII Redactor",
     task_type=REDACT_PII_TASK_TYPE.id,
+    optional_input_shape=[LANGUAGE_INPUT],
+    optional_input_shape_enum_values=LANGUAGE_ENUM_VALUES,
+    optional_input_shape_defaults=LANGUAGE_DEFAULTS,
 )
+
+
+def _task_language(task_input: dict[str, Any]) -> str:
+    """The optional language input, defaulting to English (the declared shape default)."""
+    return task_input.get("language") or "en"
+
+
+def handle_detect_pii(task_input: dict[str, Any], on_progress=None) -> dict[str, str]:
+    return {
+        "output": detect_pii(
+            task_input["input"], language=_task_language(task_input), on_progress=on_progress
+        )
+    }
+
+
+def handle_redact_pii(task_input: dict[str, Any], on_progress=None) -> dict[str, str]:
+    return {
+        "output": redact_text(
+            task_input["input"], language=_task_language(task_input), on_progress=on_progress
+        )
+    }
+
 
 TASK_PROCESSING_PROVIDERS = [
     (DETECT_PII_PROVIDER, DETECT_PII_TASK_TYPE),
     (REDACT_PII_PROVIDER, REDACT_PII_TASK_TYPE),
 ]
 TASK_HANDLERS = {
-    DETECT_PII_TASK_TYPE.id: detect_pii,
-    REDACT_PII_TASK_TYPE.id: redact_text,
+    DETECT_PII_TASK_TYPE.id: handle_detect_pii,
+    REDACT_PII_TASK_TYPE.id: handle_redact_pii,
 }
 
 # Set by `enabled_handler`, which runs in a worker thread.
@@ -117,6 +193,24 @@ async def wait_for_trigger(timeout: float) -> bool:
     return True
 
 
+# The engine state that was last reported to the Nextcloud log.
+_LAST_ENGINE_STATE: tuple[str, str | None] | None = None
+_ENGINE_STATE_LOCK = threading.Lock()
+
+
+def engine_notice() -> str | None:
+    """The message for the Nextcloud log if the engine fell back to spaCy or loaded GLiNER again."""
+    global _LAST_ENGINE_STATE
+    with _ENGINE_STATE_LOCK:
+        previous, state = _LAST_ENGINE_STATE, engine_state()
+        _LAST_ENGINE_STATE = state
+    if state[1] is not None and state != previous:
+        return f"The GLiNER model could not be loaded ({state[1]}). Texts are analyzed with the spaCy detection engine until loading it succeeds."
+    if state[1] is None and previous is not None and previous[1] is not None:
+        return "The GLiNER model is loaded. Texts are analyzed with the GLiNER detection engine again."
+    return None
+
+
 async def process_task(nc: AsyncNextcloudApp, task: dict[str, Any]) -> None:
     loop = asyncio.get_running_loop()
 
@@ -127,14 +221,14 @@ async def process_task(nc: AsyncNextcloudApp, task: dict[str, Any]) -> None:
     try:
         handler = TASK_HANDLERS[task["type"]]
         # Presidio is CPU-bound, so it runs in a worker thread to keep the event loop responsive.
-        output = await asyncio.to_thread(handler, task["input"]["input"], on_progress=on_progress)
+        output = await asyncio.to_thread(handler, task["input"], on_progress=on_progress)
     except Exception as e:
         await nc.log(LogLvl.ERROR, f"Failed to process task {task['id']}: {e}")
         await nc.providers.task_processing.report_result(
             task["id"], error_message=str(e), user_facing_error_message="The text could not be processed."
         )
         return
-    await nc.providers.task_processing.report_result(task["id"], {"output": output})
+    await nc.providers.task_processing.report_result(task["id"], output)
 
 
 async def process_tasks() -> None:
@@ -152,6 +246,9 @@ async def process_tasks() -> None:
             response = await nc.providers.task_processing.next_task(provider_ids, task_types)
             if response:
                 await process_task(nc, response["task"])
+                notice = engine_notice()
+                if notice:
+                    await nc.log(LogLvl.WARNING, notice)
             elif await wait_for_trigger(poll_interval):
                 poll_interval = POLL_INTERVAL_WITH_TRIGGER
         except Exception:
@@ -209,7 +306,9 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
             nc.notifications.create(f"Could not redact {node.name}", "The file is not a UTF-8 encoded text file.")
             return
         copy_path = redacted_copy_path(nc, node.user_path)
-        nc.files.upload(copy_path, redact_text(text))
+        # The Files action has no language input: the text decides its language, and the
+        # identifiers of every supported language are redacted wherever it found nothing.
+        nc.files.upload(copy_path, redact_text(text, language=None, foreign_identifiers=True))
         nc.notifications.create(f"Redacted copy of {node.name} saved as {posixpath.basename(copy_path)}")
     except Exception as e:
         nc.log(LogLvl.ERROR, f"Failed to redact file {file_info.fileId}: {e}")
@@ -221,6 +320,9 @@ def redact_files(user_id: str, files: list[ActionFileInfo]) -> None:
     nc.set_user(user_id)
     for file_info in files:
         redact_file(nc, file_info)
+    notice = engine_notice()
+    if notice:
+        nc.log(LogLvl.WARNING, notice)
 
 
 @APP.post(REDACT_FILE_ACTION_HANDLER)
