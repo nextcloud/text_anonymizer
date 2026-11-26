@@ -378,6 +378,37 @@ def test_gliner_model_is_loaded_from_the_persistent_storage(monkeypatch, storage
     build_engines(monkeypatch, german_model=True)
 
     assert [load["cache_dir"] for load in loads] == [expected]
+    # A request must never wait for a download: the load on the request path reads the storage only.
+    assert loads[0]["local_files_only"] is True
+
+
+def test_missing_model_is_fetched_in_the_background_at_once(monkeypatch):
+    """A model that is not in the storage never holds a request up.
+
+    The load on the request path reads the storage only and fails there. The background retry then asks the
+    Hub without waiting for a further request or for the first delay, and the engines switch once it is done.
+    """
+    from presidio_analyzer.predefined_recognizers.ner import gliner_recognizer
+
+    fake_models(monkeypatch)
+    loads = []
+
+    class StorageOrHub:
+        @staticmethod
+        def from_pretrained(model_name, **kwargs):
+            loads.append(kwargs.get("local_files_only"))
+            if kwargs.get("local_files_only"):
+                raise FileNotFoundError("the model is not in the storage")
+            return object()
+
+    monkeypatch.setattr(gliner_recognizer, "GLiNER", StorageOrHub)
+    monkeypatch.setattr(anonymizer, "GLINER_RETRY_DELAYS", (3600,))
+    analyzer, _ = anonymizer._get_engines()
+
+    assert anonymizer.engine_state() == (anonymizer.ENGINE_SPACY, "FileNotFoundError: the model is not in the storage")
+    assert "SpacyRecognizer" in recognizer_names(analyzer)
+    wait_until(lambda: anonymizer.engine_state() == (anonymizer.ENGINE_GLINER, None))
+    assert loads == [True, False]
 
 
 NRP_DATE_TEXT = "Maria Weber is a British citizen of Muslim faith who supports the Labour Party and will visit us next Tuesday."

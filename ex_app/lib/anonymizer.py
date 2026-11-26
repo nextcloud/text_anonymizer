@@ -204,12 +204,15 @@ def download_model(on_progress: Callable[[float], None]) -> bool:
     return True
 
 
-def _build_gliner_recognizers(languages: list[str]) -> list[GLiNERRecognizer]:
+def _build_gliner_recognizers(languages: list[str], download: bool = False) -> list[GLiNERRecognizer]:
     """One GLiNER recognizer per language. The first loads the model, the others share it.
 
     The constructor of every recognizer loads the model itself (``EntityRecognizer.__init__`` calls
     ``load()``), so the other languages are shallow copies of the first recognizer: apart from the
     language all of their attributes are equal, and they share the loaded model.
+
+    The model is read from the storage only, so that no request waits for a download. With ``download``
+    it is fetched from the Hub when it is missing there, which only the background retry does.
     """
     first = GLiNERRecognizer(
         supported_language=languages[0],
@@ -219,6 +222,7 @@ def _build_gliner_recognizers(languages: list[str]) -> list[GLiNERRecognizer]:
         multi_label=True,
         map_location="cpu",
         cache_dir=model_cache_dir(),
+        local_files_only=not download,
     )
     recognizers = [first]
     for language in languages[1:]:
@@ -313,6 +317,10 @@ def _schedule_gliner_retry(error: Exception) -> None:
         # Without the gliner package no attempt can succeed.
         _NEXT_GLINER_ATTEMPT = None
         return
+    if isinstance(error, FileNotFoundError):
+        # The model is not in the storage. Fetching it is the first attempt, which is due at once.
+        _NEXT_GLINER_ATTEMPT = (time.monotonic(), 0)
+        return
     index = 0 if _NEXT_GLINER_ATTEMPT is None else min(_NEXT_GLINER_ATTEMPT[1] + 1, len(GLINER_RETRY_DELAYS) - 1)
     _NEXT_GLINER_ATTEMPT = (time.monotonic() + GLINER_RETRY_DELAYS[index], index)
 
@@ -338,12 +346,15 @@ def _start_gliner_retry() -> None:
 
 
 def _retry_gliner(fallback: tuple[AnalyzerEngine, AnonymizerEngine]) -> None:
-    """Load the GLiNER model while requests keep using the fallback, then replace it in one step."""
+    """Load the GLiNER model while requests keep using the fallback, then replace it in one step.
+
+    This is the only place that may fetch the model from the Hub.
+    """
     global _NEXT_GLINER_ATTEMPT, _ENGINE_STATE, _GLINER_RETRY_RUNNING, _ENGINES
     fallback_analyzer, anonymizer_engine = fallback
     languages = fallback_analyzer.supported_languages
     try:
-        recognizers = _build_gliner_recognizers(languages)
+        recognizers = _build_gliner_recognizers(languages, download=True)
         # A new analyzer over the loaded spaCy models: a request that already holds the fallback
         # analyzer finishes with it, and no recognizer is removed from an analyzer in use.
         registry = RecognizerRegistry(
