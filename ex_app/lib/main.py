@@ -52,8 +52,10 @@ LANGUAGE_DEFAULTS = {"language": "en"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     set_handlers(app, enabled_handler, default_init=False, trigger_handler=trigger_handler)
-    if NextcloudApp().enabled_state:
+    nc = NextcloudApp()
+    if nc.enabled_state:
         APP_ENABLED.set()
+        threading.Thread(target=resume_init, args=(nc,), daemon=True).start()
     worker = asyncio.create_task(process_tasks())
     yield
     SHUTDOWN.set()
@@ -77,6 +79,20 @@ def download_model_task(nc: NextcloudApp) -> None:
     except Exception as e:
         LOGGER.warning("The GLiNER model could not be downloaded: %s", e, exc_info=True)
     nc.set_init_status(100)
+
+
+def resume_init(nc: NextcloudApp) -> None:
+    """Finish the download of the model if a restart of the container cut the init short.
+
+    AppAPI sends its init once, at the registration or the update, so a restart during the download left the
+    app at that progress for good. On every start of an enabled app the model is checked in the storage, which
+    costs no network when it is complete, and downloaded again when it is not. The progress goes to AppAPI as
+    during the init: it enables the app at the end, and it ignores the report when the init was over already.
+    """
+    try:
+        download_model_task(nc)
+    except Exception as e:
+        LOGGER.warning("The GLiNER model could not be made ready after the restart: %s", e, exc_info=True)
 
 
 @APP.post("/init")

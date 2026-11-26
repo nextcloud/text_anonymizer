@@ -127,6 +127,8 @@ GERMAN_CARD_CONTEXT = [
 GLINER_RETRY_DELAYS = (60, 300, 1800, 3600)
 
 _LOCK = threading.Lock()
+# Held for as long as a download of the model runs.
+_DOWNLOAD_LOCK = threading.Lock()
 _ENGINES: tuple[AnalyzerEngine, AnonymizerEngine] | None = None
 # The engine in use and, while GLiNER is the requested engine but could not be loaded, the error.
 _ENGINE_STATE: tuple[str, str | None] = (ENGINE_SPACY, None)
@@ -186,21 +188,40 @@ def model_cache_dir() -> str | None:
     return os.environ.get("APP_PERSISTENT_STORAGE")
 
 
+def _tokenizer_name(model_dir: str) -> str:
+    """The repository of the tokenizer, which the configuration of the model names."""
+    config = Path(model_dir, "gliner_config.json")
+    return json.loads(config.read_text(encoding="utf-8"))["model_name"]
+
+
+def _model_in_storage(cache_dir: str | None) -> bool:
+    """Whether the model and its tokenizer are complete in the storage; this asks the Hub nothing."""
+    try:
+        model_dir = snapshot_download(GLINER_MODEL, cache_dir=cache_dir, local_files_only=True)
+        AutoTokenizer.from_pretrained(_tokenizer_name(model_dir), cache_dir=cache_dir, local_files_only=True)
+    except Exception:
+        return False
+    return True
+
+
 def download_model(on_progress: Callable[[float], None]) -> bool:
     """Download the GLiNER model and its tokenizer into the persistent storage of the app.
 
-    A later load of the model then needs no network. ``on_progress`` gets the percentage of the
-    model weights that are downloaded. Nothing is downloaded when the spaCy engine is selected.
+    Only what is missing is downloaded: a model that is complete in the storage is left alone and costs no
+    network. A later load of the model then needs none either. ``on_progress`` gets the percentage of the model
+    weights that are downloaded. Nothing is downloaded when the spaCy engine is selected.
     """
     if _requested_engine() != ENGINE_GLINER:
         return False
-    cache_dir = model_cache_dir()
-    model_dir = snapshot_download(
-        GLINER_MODEL, cache_dir=cache_dir, tqdm_class=partial(_DownloadProgress, on_progress=on_progress)
-    )
-    # The tokenizer is a repository of its own, named in the model's configuration.
-    config = Path(model_dir, "gliner_config.json")
-    AutoTokenizer.from_pretrained(json.loads(config.read_text(encoding="utf-8"))["model_name"], cache_dir=cache_dir)
+    # One download at a time: the init, the start of the app and a retry may ask for the model together.
+    with _DOWNLOAD_LOCK:
+        cache_dir = model_cache_dir()
+        if not _model_in_storage(cache_dir):
+            model_dir = snapshot_download(
+                GLINER_MODEL, cache_dir=cache_dir, tqdm_class=partial(_DownloadProgress, on_progress=on_progress)
+            )
+            # The tokenizer is a repository of its own, named in the model's configuration.
+            AutoTokenizer.from_pretrained(_tokenizer_name(model_dir), cache_dir=cache_dir)
     return True
 
 
