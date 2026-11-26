@@ -1459,6 +1459,65 @@ def test_a_record_that_cannot_be_read_does_not_count():
     )
 
 
+class UnwritableRecords(FakeAppConfig):
+    """``nc.appconfig_ex`` whose every write fails, as when Nextcloud cannot be reached for that one request."""
+
+    def set_value(self, key, value, sensitive=None) -> None:
+        self.calls.append(("set_value", key))
+        raise NextcloudException(503, "Server error")
+
+
+def test_a_failed_record_does_not_make_a_saved_copy_a_failure(caplog):
+    """The copy is saved and right; only the next action cannot tell that it is current. The log says so."""
+    nc, docs = build_folder_tree([("docs/a.txt", b"one", "text/plain")])
+    store = nc.appconfig_ex
+    nc.appconfig_ex = UnwritableRecords()
+    with caplog.at_level(logging.WARNING, logger="batch"):
+        report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.detail for result in report.redacted] == ["docs/a (redacted).txt"] and report.failed == []
+    assert list(nc.files.uploads) == ["docs/a (redacted).txt"]
+    assert caplog.record_tuples == [
+        (
+            "batch",
+            logging.WARNING,
+            "Saved the redacted copy docs/a (redacted).txt of docs/a.txt, but could not record "
+            "the content it was made from ([503] Server error): the next action on the file writes another copy",
+        ),
+    ]
+    # The copy has no record, so the next run writes one numbered copy; from then on the file is up to date.
+    nc.appconfig_ex = store
+    redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert sorted(nc.files.uploads) == ["docs/a (redacted 2).txt", "docs/a (redacted).txt"]
+    nc.files.downloads.clear()
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert nc.files.downloads == []
+    assert [result.detail for result in report.skipped].count("a redacted copy is already up to date") == 1
+
+
+def test_an_upload_that_fails_writes_no_record():
+    """A record without its copy would make a file up to date that has no current copy."""
+    nc, docs = build_folder_tree([("docs/a.txt", b"one", "text/plain")])
+
+    def failing_upload(path, content):
+        raise NextcloudException(507, "Insufficient Storage")
+
+    nc.files.upload = failing_upload
+    report = redact_folder(nc, docs, redact=fake_redact, max_bytes=NO_LIMIT)
+    assert [result.detail for result in report.failed] == ["[507] Insufficient Storage"]
+    assert not any(method == "set_value" for method, _what in nc.appconfig_ex.calls)
+
+
+def test_the_single_file_action_says_saved_when_only_the_record_failed(monkeypatch):
+    nc = FakeNc()
+    node = nc.files.add_file("notes.txt", b"one", "text/plain")
+    nc.appconfig_ex = UnwritableRecords()
+    monkeypatch.setattr(main, "redact_text", fake_redact)
+    main.redact_file(nc, action_info(node, "file"))
+    assert list(nc.files.uploads) == ["notes (redacted).txt"]
+    assert nc.notifications.created == [("Redacted copy of notes.txt saved as notes (redacted).txt", "")]
+    assert nc.logs == []
+
+
 @contextlib.contextmanager
 def logging_to(posted: list, stall: float = 0.0, gate: threading.Event | None = None, loglevel: int = 2):
     """Run ``configure_logging`` with what it would post to Nextcloud collected in ``posted`` instead.

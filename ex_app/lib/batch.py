@@ -349,7 +349,18 @@ def redact_file_copy(
                     return None
         text = nc.files.download(node).decode("utf-8")
         copy = nc.files.upload(copy_path, redact(text))
-        remember_copy(nc, node, copy, record)
+        try:
+            remember_copy(nc, node, copy, record)
+        except Exception as e:
+            # The copy is saved and right; without its record the next action writes one more, as for any file
+            # without a record.
+            LOGGER.warning(
+                "Saved the redacted copy %s of %s, but could not record the content it was made from (%s): "
+                "the next action on the file writes another copy",
+                copy_path,
+                node.user_path,
+                e,
+            )
         return copy_path
 
 
@@ -364,9 +375,10 @@ def redact_folder(
 
     Files are processed one at a time; a failing file is recorded and the run continues, so files redacted
     before the failure keep their copies. A subfolder that cannot be listed is recorded too and its files are
-    left out. A redacted copy is skipped whatever its age, and a file whose redacted copy is newer than itself is
-    skipped too, so a repeated action on an unchanged folder is a no-op. ``on_progress`` is called with
-    ``(index, total, filename)`` before each file is processed.
+    left out. A redacted copy is skipped whatever its age, and a file is skipped too when a redacted copy of it was
+    made from the content it still has, i.e. while the etag remembered for the file is the one it has now, so a
+    repeated action on an unchanged folder is a no-op. ``on_progress`` is called with ``(index, total, filename)``
+    before each file is processed.
     """
     if redact is None:
         redact = redact_text
