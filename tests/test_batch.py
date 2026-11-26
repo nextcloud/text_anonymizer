@@ -610,6 +610,51 @@ def test_redacted_copy_path_takes_the_first_free_number(existing, expected):
     assert batch.redacted_copy_path(nc, "docs/notes.txt") == expected
 
 
+def test_path_exists():
+    nc = FakeNc()
+    nc.files.add_file("/a.txt", b"a", "text/plain")
+    assert batch.path_exists(nc, "/a.txt")
+    assert not batch.path_exists(nc, "/b.txt")
+
+
+def test_path_exists_reraises_other_errors():
+    nc = FakeNc()
+
+    def failing_by_path(user_path):
+        raise NextcloudException(500, "Server Error")
+
+    nc.files.by_path = failing_by_path
+    with pytest.raises(NextcloudException):
+        batch.path_exists(nc, "/a.txt")
+
+
+@pytest.mark.parametrize(
+    ("user_path", "existing", "expected"),
+    [
+        ("/notes.txt", (), "/notes (redacted).txt"),
+        ("/dir/notes.md", (), "/dir/notes (redacted).md"),
+        ("/README", (), "/README (redacted)"),
+        ("/notes.txt", ("/notes (redacted).txt",), "/notes (redacted 2).txt"),
+        (
+            "/notes.txt",
+            ("/notes (redacted).txt", "/notes (redacted 2).txt"),
+            "/notes (redacted 3).txt",
+        ),
+        ("/notes (redacted).txt", ("/notes (redacted).txt",), "/notes (redacted 2).txt"),
+        (
+            "/notes (redacted 2).txt",
+            ("/notes (redacted).txt", "/notes (redacted 2).txt"),
+            "/notes (redacted 3).txt",
+        ),
+    ],
+)
+def test_redacted_copy_path(user_path, existing, expected):
+    nc = FakeNc()
+    for path in existing:
+        nc.files.add_file(path, b"copy", "text/plain")
+    assert batch.redacted_copy_path(nc, user_path) == expected
+
+
 @pytest.mark.parametrize(
     "mimetype",
     ["text/plain", "text/csv", "text/markdown", "TEXT/PLAIN", "application/json", "application/xml",
