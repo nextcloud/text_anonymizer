@@ -15,10 +15,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from functools import partial
 from pathlib import Path
-
-from huggingface_hub import snapshot_download
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import (
@@ -44,7 +41,6 @@ from presidio_anonymizer.entities import OperatorConfig
 from py3langid.langid import MODEL_FILE, LanguageIdentifier
 from spacy.util import is_package
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
 ProgressCallback = Callable[[float], None]
 
@@ -52,6 +48,8 @@ LOGGER = logging.getLogger(__name__)
 
 # Detection engine selection: ENGINE_GLINER (default) or ENGINE_SPACY.
 ENGINE_ENV_VAR = "TEXT_ANONYMIZER_ENGINE"
+# Whether an unknown value of the engine variable was reported in this process.
+_UNKNOWN_ENGINE_REPORTED = False
 ENGINE_GLINER = "gliner"
 ENGINE_SPACY = "spacy"
 
@@ -107,8 +105,11 @@ GERMAN_RECOGNIZERS = (
     DeTaxNumberRecognizer,
     DeVatIdRecognizer,
 )
-# The types the spaCy NER keeps delivering next to the GLiNER model.
+# The types the spaCy NER keeps delivering next to the GLiNER model, and the languages whose model has the
+# labels behind them: en_core_web_lg emits NORP, DATE and TIME. de_core_news_lg emits PER, LOC, ORG and MISC
+# only, so German gets both types from the GLiNER model alone.
 GLINER_SPACY_ENTITIES = ("NRP", "DATE_TIME")
+GLINER_SPACY_LANGUAGES = ("en",)
 # Presidio's default configuration registers the credit card recognizer for en, es, it and pl.
 GERMAN_CARD_CONTEXT = [
     "kreditkarte",
@@ -143,10 +144,15 @@ CHUNK_SIZE = 10_000
 
 
 def _requested_engine() -> str:
-    """Read the detection engine choice from the environment, defaulting to GLiNER."""
-    engine = os.environ.get(ENGINE_ENV_VAR, ENGINE_GLINER).strip().lower()
+    """Read the detection engine choice from the environment, defaulting to GLiNER. An empty value is no choice."""
+    global _UNKNOWN_ENGINE_REPORTED
+    engine = os.environ.get(ENGINE_ENV_VAR, "").strip().lower()
+    if not engine:
+        return ENGINE_GLINER
     if engine not in (ENGINE_GLINER, ENGINE_SPACY):
-        LOGGER.warning("Unknown %s value %r, using the %s engine", ENGINE_ENV_VAR, engine, ENGINE_GLINER)
+        if not _UNKNOWN_ENGINE_REPORTED:
+            _UNKNOWN_ENGINE_REPORTED = True
+            LOGGER.warning("Unknown %s value %r, using the %s engine", ENGINE_ENV_VAR, engine, ENGINE_GLINER)
         return ENGINE_GLINER
     return engine
 
@@ -164,21 +170,6 @@ def _supported_languages() -> list[str]:
     return languages
 
 
-class _DownloadProgress(tqdm):
-    """A progress bar of huggingface_hub that hands its percentage to a callback."""
-
-    def __init__(self, *args, on_progress: Callable[[float], None], **kwargs):
-        # huggingface_hub names the bar, which tqdm does not accept.
-        kwargs.pop("name", None)
-        self._on_progress = on_progress
-        super().__init__(*args, **kwargs)
-
-    def display(self, msg=None, pos=None) -> None:
-        if self.total:
-            self._on_progress(self.n / self.total * 100)
-        super().display(msg, pos)
-
-
 def model_cache_dir() -> str | None:
     """The persistent storage of the app, which survives updates, or None for huggingface_hub's cache.
 
@@ -194,11 +185,24 @@ def _tokenizer_name(model_dir: str) -> str:
     return json.loads(config.read_text(encoding="utf-8"))["model_name"]
 
 
+def _hub_api() -> tuple[Callable, type]:
+    """huggingface_hub's ``snapshot_download`` and transformers' ``AutoTokenizer``.
+
+    Only the download needs the two packages, so they are imported here and not with the module: the spaCy
+    engine and its fallback start without them.
+    """
+    from huggingface_hub import snapshot_download  # pylint: disable=import-outside-toplevel
+    from transformers import AutoTokenizer  # pylint: disable=import-outside-toplevel
+
+    return snapshot_download, AutoTokenizer
+
+
 def _model_in_storage(cache_dir: str | None) -> bool:
     """Whether the model and its tokenizer are complete in the storage; this asks the Hub nothing."""
+    snapshot_download, tokenizer_class = _hub_api()
     try:
         model_dir = snapshot_download(GLINER_MODEL, cache_dir=cache_dir, local_files_only=True)
-        AutoTokenizer.from_pretrained(_tokenizer_name(model_dir), cache_dir=cache_dir, local_files_only=True)
+        tokenizer_class.from_pretrained(_tokenizer_name(model_dir), cache_dir=cache_dir, local_files_only=True)
     except Exception:
         return False
     return True
@@ -208,20 +212,43 @@ def download_model(on_progress: Callable[[float], None]) -> bool:
     """Download the GLiNER model and its tokenizer into the persistent storage of the app.
 
     Only what is missing is downloaded: a model that is complete in the storage is left alone and costs no
-    network. A later load of the model then needs none either. ``on_progress`` gets the percentage of the model
-    weights that are downloaded. Nothing is downloaded when the spaCy engine is selected.
+    network. A later load of the model then needs none either. ``on_progress`` gets the percentage of the
+    model's bytes that are on disk, each percent once, so it never drops back. Nothing is downloaded when the
+    spaCy engine is selected.
     """
     if _requested_engine() != ENGINE_GLINER:
         return False
+    snapshot_download, tokenizer_class = _hub_api()
     # One download at a time: the init, the start of the app and a retry may ask for the model together.
     with _DOWNLOAD_LOCK:
         cache_dir = model_cache_dir()
         if not _model_in_storage(cache_dir):
-            model_dir = snapshot_download(
-                GLINER_MODEL, cache_dir=cache_dir, tqdm_class=partial(_DownloadProgress, on_progress=on_progress)
-            )
+            # A dry run tells the size of every file, which the bars cannot: their totals grow as files start.
+            files = snapshot_download(GLINER_MODEL, cache_dir=cache_dir, dry_run=True)
+            total = sum(file.file_size or 0 for file in files)
+            bytes_seen = 0
+            reported = -1
+
+            class DownloadProgress(tqdm):
+                """The bars huggingface_hub draws for the download; the two of them counted in bytes are read."""
+
+                def __init__(self, *args, **kwargs):
+                    self._counts_bytes = kwargs.get("unit") == "B"
+                    super().__init__(*args, **kwargs)
+
+                def display(self, msg=None, pos=None):
+                    super().display(msg, pos)
+                    nonlocal bytes_seen, reported
+                    if self._counts_bytes and total:
+                        bytes_seen = max(bytes_seen, self.n)
+                        percent = int(bytes_seen / total * 100)
+                        if percent > reported:
+                            reported = percent
+                            on_progress(percent)
+
+            model_dir = snapshot_download(GLINER_MODEL, cache_dir=cache_dir, tqdm_class=DownloadProgress)
             # The tokenizer is a repository of its own, named in the model's configuration.
-            AutoTokenizer.from_pretrained(_tokenizer_name(model_dir), cache_dir=cache_dir)
+            tokenizer_class.from_pretrained(_tokenizer_name(model_dir), cache_dir=cache_dir)
     return True
 
 
@@ -254,14 +281,14 @@ def _build_gliner_recognizers(languages: list[str], download: bool = False) -> l
 
 
 def _use_gliner(analyzer: AnalyzerEngine, recognizers: list[GLiNERRecognizer]) -> None:
-    """Register the GLiNER recognizers and reduce the spaCy NER recognizers to NRP and DATE_TIME.
+    """Register the GLiNER recognizers and reduce the spaCy NER of English to NRP and DATE_TIME.
 
     The spaCy pipeline runs for every engine, so its spans of these two types come at no cost as a
     second source next to the labels of the model.
     """
     registry = analyzer.registry
     registry.remove_recognizer("SpacyRecognizer")
-    for language in analyzer.supported_languages:
+    for language in GLINER_SPACY_LANGUAGES:
         registry.add_recognizer(SpacyRecognizer(supported_language=language, supported_entities=list(GLINER_SPACY_ENTITIES)))
     for recognizer in recognizers:
         registry.add_recognizer(recognizer)
@@ -270,8 +297,9 @@ def _use_gliner(analyzer: AnalyzerEngine, recognizers: list[GLiNERRecognizer]) -
 def _enable_gliner(analyzer: AnalyzerEngine, languages: list[str]) -> bool:
     """Switch the analyzer to the GLiNER engine: one recognizer per language, sharing one loaded model.
 
-    If loading fails for any reason (gliner package missing, model download unavailable), the
-    spaCy recognizers are kept as the fallback engine and the load is tried again later.
+    If loading fails (the model is missing or cannot be loaded), the spaCy recognizers are kept as the
+    fallback engine and the load is tried again later. Without the gliner package no attempt can succeed,
+    so none is made.
     """
     try:
         recognizers = _build_gliner_recognizers(languages)

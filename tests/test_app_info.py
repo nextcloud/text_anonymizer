@@ -25,6 +25,10 @@ def test_engine_variable_is_declared_for_administrators():
     variable = declared_variables()[anonymizer.ENGINE_ENV_VAR]
 
     assert variable.findtext("display-name")
+    assert variable.findtext("default") == anonymizer.ENGINE_GLINER
     description = variable.findtext("description")
     assert f"{anonymizer.ENGINE_GLINER} (default)" in description
     assert anonymizer.ENGINE_SPACY in description
+    # The weights are fetched while AppAPI initializes the app, not on first use.
+    assert "first use" not in description
+    assert "installed or initialized" in description

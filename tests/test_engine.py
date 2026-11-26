@@ -127,6 +127,7 @@ def build_engines(monkeypatch, *, german_model=False, gliner=None):
 
 def reset_engine_state():
     anonymizer._ENGINES = None
+    anonymizer._UNKNOWN_ENGINE_REPORTED = False
     anonymizer._ENGINE_STATE = (anonymizer.ENGINE_SPACY, None)
     anonymizer._NEXT_GLINER_ATTEMPT = None
     anonymizer._GLINER_RETRY_RUNNING = False
@@ -405,7 +406,10 @@ def test_missing_model_is_fetched_in_the_background_at_once(monkeypatch):
     monkeypatch.setattr(anonymizer, "GLINER_RETRY_DELAYS", (3600,))
     analyzer, _ = anonymizer._get_engines()
 
-    assert anonymizer.engine_state() == (anonymizer.ENGINE_SPACY, "FileNotFoundError: the model is not in the storage")
+    assert anonymizer.engine_state() == (
+        anonymizer.ENGINE_SPACY,
+        "FileNotFoundError: the model is not in the storage",
+    )
     assert "SpacyRecognizer" in recognizer_names(analyzer)
     wait_until(lambda: anonymizer.engine_state() == (anonymizer.ENGINE_GLINER, None))
     assert loads == [True, False]
@@ -456,19 +460,23 @@ def test_gliner_is_asked_for_nrp_and_date_labels(monkeypatch):
 
 
 def test_gliner_engine_keeps_spacy_ner_for_nrp_and_date_time_only(monkeypatch):
-    """Next to the model, the spaCy NER delivers only the two types of the labels, for every language."""
+    """Next to the model, the spaCy NER of English delivers only the two types of its labels.
+
+    de_core_news_lg emits PER, LOC, ORG and MISC only, so German gets no reduced recognizer: it would never
+    return anything.
+    """
     fake_gliner = make_fake_gliner({"en": [], "de": []})
     analyzer, _ = build_engines(monkeypatch, german_model=True, gliner=fake_gliner)
 
     assert spacy_entities(analyzer, "en") == {"NRP", "DATE_TIME"}
-    assert spacy_entities(analyzer, "de") == {"NRP", "DATE_TIME"}
+    assert spacy_entities(analyzer, "de") == set()
 
 
+@pytest.mark.spacy
 @pytest.mark.skipif(not ENGLISH_MODEL_INSTALLED, reason="the English spaCy model is not installed")
 def test_spacy_ner_delivers_nrp_and_date_time_with_the_gliner_engine(monkeypatch):
     """With the real spaCy model, the two types come from the spaCy NER even if the model finds nothing."""
-    fake_gliner = make_fake_gliner({"en": []})
-    build_engines(monkeypatch, gliner=fake_gliner)
+    monkeypatch.setattr(anonymizer, "GLiNERRecognizer", make_fake_gliner({"en": []}))
 
     detected = anonymizer.detect_pii(NRP_DATE_TEXT)
     assert "NRP: British" in detected
@@ -521,6 +529,21 @@ def test_requested_engine_parsing(monkeypatch, value, expected):
     else:
         monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, value)
     assert anonymizer._requested_engine() == expected
+
+
+def test_empty_engine_value_is_no_choice_and_needs_no_warning(monkeypatch, caplog):
+    """An empty value means the variable was not set: GLiNER is used without a warning about it."""
+    monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, "")
+    assert anonymizer._requested_engine() == anonymizer.ENGINE_GLINER
+    assert caplog.text == ""
+
+
+def test_an_unknown_engine_value_is_reported_once(monkeypatch, caplog):
+    """An unknown value is reported once per process, not at every download and every engine build."""
+    monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, "transformers")
+
+    assert [anonymizer._requested_engine() for _ in range(3)] == [anonymizer.ENGINE_GLINER] * 3
+    assert len(caplog.records) == 1
 
 
 def test_german_pack_registered_when_model_installed(monkeypatch):
@@ -626,6 +649,7 @@ def test_unsupported_language_falls_back_to_english(monkeypatch, caplog):
     assert "analyzing the text as English" in caplog.text
 
 
+@pytest.mark.spacy
 @pytest.mark.skipif(not ENGLISH_MODEL_INSTALLED, reason="the English spaCy model is not installed")
 def test_spacy_engine_detects_english_pii(monkeypatch):
     """The spaCy engine detects English PII end to end, without GLiNER and without network."""
@@ -638,6 +662,7 @@ def test_spacy_engine_detects_english_pii(monkeypatch):
     not (ENGLISH_MODEL_INSTALLED and GERMAN_MODEL_INSTALLED),
     reason="the English and German spaCy models are not installed",
 )
+@pytest.mark.spacy
 def test_spacy_engine_detects_german_pii(monkeypatch):
     """The spaCy fallback engine detects German PII end to end when German is requested."""
     monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, anonymizer.ENGINE_SPACY)
@@ -646,6 +671,7 @@ def test_spacy_engine_detects_german_pii(monkeypatch):
     assert "PERSON: Anna Müller" in detected
 
 
+@pytest.mark.spacy
 @pytest.mark.skipif(not ENGLISH_MODEL_INSTALLED, reason="the English spaCy model is not installed")
 def test_gliner_failure_falls_back_to_working_spacy_detection(monkeypatch):
     """After a GLiNER load failure, detection still works through the real spaCy pipeline."""

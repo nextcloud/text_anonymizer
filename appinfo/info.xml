@@ -54,7 +54,8 @@ Powered by [Presidio](https://presidio.dataprivacystack.org/).
 			<variable>
 				<name>TEXT_ANONYMIZER_ENGINE</name>
 				<display-name>Detection engine</display-name>
-				<description>gliner (default) detects entities with the GLiNER model and downloads its weights, about 1.2 GB, on first use. spacy detects them with the built-in spaCy models and downloads nothing.</description>
+				<description>gliner (default) detects entities with the GLiNER model; its weights, about 1.2 GB, are downloaded while the app is installed or initialized. spacy detects them with the built-in spaCy models and downloads nothing.</description>
+				<default>gliner</default>
 			</variable>
 		</environment-variables>
 		<routes>

@@ -7,7 +7,10 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,6 +20,8 @@ import pytest
 from fastapi import BackgroundTasks
 
 TOKENIZER = "microsoft/mdeberta-v3-base"
+# What a dry run of the download reports: one big file and three small ones.
+MODEL_FILES = [SimpleNamespace(file_size=size) for size in (1_500_000, 2_000, 700, 300)]
 
 
 class FakeNC:
@@ -35,7 +40,7 @@ def downloads(monkeypatch, tmp_path):
     so a fetch that may read the storage only (``local_files_only``) succeeds without one.
     """
     calls = SimpleNamespace(
-        snapshot=[], tokenizer=[], storage=str(tmp_path / "nc_app"), storage_model_complete=False
+        snapshot=[], dry_runs=[], tokenizer=[], storage=str(tmp_path / "nc_app"), storage_model_complete=False
     )
     monkeypatch.setattr(anonymizer, "model_cache_dir", lambda: calls.storage, raising=False)
 
@@ -43,6 +48,9 @@ def downloads(monkeypatch, tmp_path):
         return kwargs.get("local_files_only") and not calls.storage_model_complete
 
     def snapshot_download(model, **kwargs):
+        if kwargs.get("dry_run"):
+            calls.dry_runs.append(model)
+            return MODEL_FILES
         calls.snapshot.append((model, kwargs))
         if missing_from_storage(kwargs):
             raise FileNotFoundError("LocalEntryNotFoundError: the model is not in the storage")
@@ -57,27 +65,50 @@ def downloads(monkeypatch, tmp_path):
             raise OSError("the tokenizer is not in the storage")
         return None
 
-    monkeypatch.setattr(anonymizer, "snapshot_download", snapshot_download, raising=False)
-    monkeypatch.setattr(anonymizer.AutoTokenizer, "from_pretrained", classmethod(from_pretrained), raising=False)
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", classmethod(from_pretrained))
     return calls
 
 
 def test_model_and_tokenizer_are_downloaded_into_the_persistent_storage(monkeypatch, downloads):
     """Both repositories of the model go to the app's persistent storage, which survives updates."""
-    progress = []
-
-    assert anonymizer.download_model(progress.append) is True
+    assert anonymizer.download_model(lambda percent: None) is True
     (download,) = [options for _, options in downloads.snapshot if not options.get("local_files_only")]
     assert download["cache_dir"] == downloads.storage
     assert downloads.tokenizer[-1] == (TOKENIZER, {"cache_dir": downloads.storage})
-    # The progress bar class reports its percentage, as huggingface_hub drives it.
+
+
+def test_progress_is_monotonic_and_never_early(monkeypatch, downloads):
+    """The percentage handed on is that of the bytes on disk over the size of all the files.
+
+    huggingface_hub creates three bars for one download, and the totals of its two byte bars grow as each file
+    starts, so the ratio of a single bar jumps and drops. The bars are driven the way huggingface_hub drives them.
+    """
+    progress = []
+    anonymizer.download_model(progress.append)
+    (bar_class,) = [options["tqdm_class"] for _, options in downloads.snapshot if "tqdm_class" in options]
+
     with open(os.devnull, "w") as sink:
-        bar = download["tqdm_class"](total=100, file=sink)
-        bar.n = 50
-        bar.display()
-        bar.n = 100
-        bar.display()
-    assert progress == [0.0, 50.0, 100.0]
+        # Two of the bars huggingface_hub creates are counted in bytes; the third counts files.
+        transfer = bar_class(total=0, unit="B", unit_scale=True, file=sink)
+        reconstruct = bar_class(total=0, unit="B", unit_scale=True, file=sink)
+        file_count = bar_class(total=4, file=sink)
+        # The three small files are done at once: each bar is at 100 % of what has started.
+        for done, started in ((2_000, 2_000), (700, 2_700), (300, 3_000)):
+            transfer.n = reconstruct.n = done
+            transfer.total = reconstruct.total = started
+            transfer.display()
+            reconstruct.display()
+        file_count.n = 3
+        file_count.display()
+        # Then the big file starts, its size joins the totals, and it arrives.
+        transfer.total = reconstruct.total = 1_503_000
+        for done in (1_000_000, 1_502_999, 1_503_000):
+            transfer.n = reconstruct.n = done
+            transfer.display()
+            reconstruct.display()
+
+    assert progress == [0, 66, 99, 100]
 
 
 def test_nothing_is_downloaded_for_the_spacy_engine(monkeypatch, downloads):
@@ -199,3 +230,26 @@ def test_resume_init_reports_the_progress_and_never_raises(monkeypatch, caplog):
         main.resume_init(nc)
 
     assert "after the restart" in caplog.text
+
+
+def test_module_needs_the_packages_of_the_download_only_for_the_download():
+    """Without transformers and huggingface_hub the app still imports and the spaCy engine is selected.
+
+    The two are needed to fetch the model only. gliner imports them as well, which Presidio catches: the
+    fallback to spaCy works without them.
+    """
+    code = "\n".join(
+        [
+            "import os, sys",
+            "sys.modules['transformers'] = None",
+            "sys.modules['huggingface_hub'] = None",
+            "import anonymizer",
+            "os.environ[anonymizer.ENGINE_ENV_VAR] = anonymizer.ENGINE_SPACY",
+            "assert anonymizer.download_model(lambda percent: None) is False",
+        ]
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(anonymizer.__file__).parent)}
+
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=300)
+
+    assert result.returncode == 0, result.stderr[-1500:]
