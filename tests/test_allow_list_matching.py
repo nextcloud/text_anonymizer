@@ -238,3 +238,31 @@ def test_the_enclosing_region_is_found_as_by_looking_through_every_one():
             text,
             [(result.start, result.end) for result in results],
         )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "text", "rules", "redacted"),
+    [
+        pytest.param(r"\N{EM DASH}x", "The code\u2014x\u2014marks it.", (("PERSON", "x"), ("LOCATION", "it")),
+                     "The code\u2014x\u2014marks <LOCATION>.", id="named-escape"),
+        pytest.param("(?x)Acme # {note}", "Anna Meyer works at Acme.", (("PERSON", "Anna Meyer"), ("LOCATION", "Acme")),
+                     "<PERSON> works at Acme.", id="brace-in-a-comment"),
+        pytest.param(r"(?# a {note})Acme", "Anna Meyer works at Acme.",
+                     (("PERSON", "Anna Meyer"), ("LOCATION", "Acme")),
+                     "<PERSON> works at Acme.", id="brace-in-a-group"),
+        pytest.param(r"Anna\N{EM DASH}Marie", "Anna\u2014Marie works in Berlin.",
+                     (("PERSON", "Anna\u2014Marie"), ("LOCATION", "Berlin")), "Anna\u2014Marie works in <LOCATION>.",
+                     id="named-escape-in-a-name"),
+        pytest.param("{note}", "Anna Meyer saw {note} in Berlin.",
+                     (("ORGANIZATION", "{note}"), ("PERSON", "Anna Meyer")), "<PERSON> saw {note} in Berlin.",
+                     id="braces-around-a-word"),
+        pytest.param("Ann{e<=1}", "Ann{e<=1} works in Berlin.", (("PERSON", "Ann{e<=1}"), ("LOCATION", "Berlin")),
+                     "Ann{e<=1} works in <LOCATION>.", id="what-was-refused-as-fuzzy"),
+
+    ],
+)
+def test_a_pattern_with_a_brace_or_a_named_escape_keeps_what_re_says_it_names(engines, pattern, text, rules, redacted):
+    """The reviewer's examples: the check for fuzzy matches refused the named escapes of Unicode and every
+    brace in a comment, so the names these patterns cover were redacted."""
+    engines(*rules)
+    assert anonymizer.redact_text(text, settings=Settings(allow_patterns=(pattern,))) == redacted

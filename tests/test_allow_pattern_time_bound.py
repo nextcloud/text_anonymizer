@@ -4,11 +4,13 @@
 """The time bound on allow-list patterns: no administrator's pattern can hold the task worker."""
 
 import inspect
+import itertools
 import logging
 import random
 import re
 import threading
 import time
+import warnings
 
 import pytest
 import regex
@@ -105,16 +107,91 @@ def test_the_patterns_run_under_an_engine_that_bounds_the_time():
         pytest.param("Acme{i<=2}", "Acmeee", id="insertions"),
         pytest.param("Nextcloud {d<=1}GmbH", "NextcloudGmbH", id="deletions"),
         pytest.param("a{e}", "x", id="unbounded"),
+        pytest.param("a{e<=0}", "a", id="a-constraint-that-permits-nothing"),
+        pytest.param("(?x)a{ e}", "a", id="a-space-in-the-constraint"),
+        pytest.param("(?x)a{1, 2}", "a", id="a-spaced-counted-repeat"),
     ],
 )
-def test_a_brace_that_is_no_counted_repeat_is_refused(caplog, pattern, text):
-    """re reads the brace as a literal; the engine would read a fuzzy match, which keeps texts the pattern does not name."""
+def test_a_brace_that_is_no_counted_repeat_is_a_literal_for_the_engine_too(pattern, text):
+    """re reads the brace as a literal. Read by the engine as written, it would be a fuzzy match or a
+    repeat, which keeps texts the pattern does not name; so the engine gets the brace escaped."""
     assert re.compile(pattern).fullmatch(text) is None
     assert regex.compile(pattern).fullmatch(text) is not None
+    ((source, compiled),) = parse_allow_patterns(pattern)
+    assert source == pattern
+    assert compiled.fullmatch(text) is None
+    plain = re.compile(pattern)
+    assert [compiled.fullmatch(letter) is not None for letter in ("a", "b", "x", "{", "}")] == [
+        plain.fullmatch(letter) is not None for letter in ("a", "b", "x", "{", "}")
+    ]
+
+
+def _strings():
+    """Every string of at most four characters from "ab", and of at most three from "ab{}"."""
+    for letters, length in (("ab", 4), ("ab{}", 3)):
+        for size in range(length + 1):
+            for characters in itertools.product(letters, repeat=size):
+                yield "".join(characters)
+
+
+def _reads_the_same(compiled, plain):
+    return all(
+        (compiled.fullmatch(string) is not None) == (plain.fullmatch(string) is not None) for string in _strings()
+    )
+
+
+def test_an_accepted_pattern_is_read_by_the_engine_as_re_reads_it():
+    """What the engine is given must mean what Python's re says it means, over patterns put together at
+    random: braces, escapes, classes, groups, flags, comments, counted repeats and fuzzy constraints."""
+    tokens = ["a", "b", r"\N{LATIN SMALL LETTER A}", "[ab]", "[{]", "[^{]", r"\{", "}", "{", "e", "i", "s", "d",
+              "<=", "<", "1", "2", ",", "(", ")", "(?:", "(?x)", "(?x:", "(?-x:", "(?#c)", "#", " ", "*", "+", "?",
+              "|", "^", "$", r"\b", "\\"]
+    generator = random.Random(31)
+    accepted = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)  # what re says of a nested set is its own reading
+        for _ in range(3000):
+            source = "".join(generator.choice(tokens) for _ in range(generator.randrange(1, 7))).strip()
+            if not source:
+                continue
+            try:
+                plain = re.compile(source)
+            except re.error:
+                continue
+            parsed = parse_allow_patterns(source)
+            if plain.fullmatch("") is not None:
+                assert parsed == (), source
+                continue
+            assert len(parsed) == 1, source
+            assert _reads_the_same(parsed[0][1], plain), source
+            accepted += 1
+    assert accepted > 1000
+
+
+@pytest.mark.parametrize(
+    ("pattern", "reason"),
+    [
+        pytest.param(r"[[:alpha:]]+", "POSIX class", id="posix-class"),
+        pytest.param(r"[^[:digit:]]x", "POSIX class", id="negated-posix-class"),
+        pytest.param(r"[a-z[:alpha:]]", "POSIX class", id="posix-class-among-members"),
+        pytest.param("(?x) Anna \u3000Marie", "Unicode space", id="verbose-mode"),
+        pytest.param("(?x: Acme\u3000GmbH )", "Unicode space", id="scoped-verbose-mode"),
+    ],
+)
+def test_what_the_engine_reads_wider_than_re_is_refused(caplog, pattern, reason):
+    """Two constructs mean one thing to the engine and another to re, and no rewriting can mend that."""
     with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
         assert parse_allow_patterns(pattern) == ()
-    assert pattern in caplog.text
-    assert "write it as '\\{'" in caplog.text
+    assert repr(pattern) in caplog.text
+    assert reason in caplog.text
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["[[]", "[a[b]]", "[a&&b]", "[a||b]", "[a~~b]", "[:alpha:]", "Acme\u3000GmbH"],
+)
+def test_what_both_engines_read_alike_is_accepted(pattern):
+    assert parse_allow_patterns(pattern)[0][0] == pattern
 
 
 @pytest.mark.parametrize(

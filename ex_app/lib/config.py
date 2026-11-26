@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import time
+import warnings
 from bisect import bisect_right
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -94,50 +95,94 @@ def parse_ignored_entity_types(raw: str) -> frozenset[str]:
     return frozenset(item.strip().upper() for item in raw.split(",") if item.strip())
 
 
-#: A counted repeat: ``{m}``, ``{m,}``, ``{,n}`` or ``{m,n}``.
-_COUNTED_REPEAT = re.compile(r"\{\d*(,\d*)?\}")
+#: A counted repeat as Python's ``re`` reads one: ``{m}``, ``{m,}``, ``{,n}``, ``{m,n}`` or ``{,}``.
+#: Any other brace is a literal to ``re`` and the start of a fuzzy-match constraint to the engine.
+_COUNTED_REPEAT = re.compile(r"\{(?:[0-9]+|[0-9]*,[0-9]*)\}")
+
+#: A POSIX class in a character class, ``[[:alpha:]]``: a class of its own to the engine, a set of
+#: those characters to ``re``.
+_POSIX_CLASS = re.compile(r"\[:\^?[A-Za-z]+:\]")
+
+#: A group that sets the verbose mode: ``(?x)`` or ``(?ix)`` at the start, ``(?x:...)`` anywhere.
+_VERBOSE_GROUP = re.compile(r"\(\?[aiLmsux-]*x[aiLmsux-]*[:)]")
+
+#: The whitespace ``re`` passes over in verbose mode. The engine passes over every Unicode space.
+_ASCII_SPACE = " \t\n\r\v\f"
 
 
-def _reads_as_fuzzy_match(source: str) -> bool:
-    """Whether ``source`` has a ``{`` outside a character class that opens no counted repeat.
+def _braces_escaped(source: str) -> str:
+    """``source`` with every ``{`` that ``re`` reads as a literal written as ``\\{``.
 
-    Python's ``re`` reads such a brace as a literal, but the ``regex`` engine, which runs the
-    allow-list for its time bound, reads what follows it as a fuzzy-match constraint, so the
-    pattern would then keep texts it does not name.
+    To the engine that runs the allow-list a brace that opens no counted repeat starts a
+    fuzzy-match constraint, which keeps texts the pattern does not name; ``\\{`` is a literal brace
+    to both. The brace of a named character, ``\\N{EM DASH}``, belongs to the escape and stays.
     """
+    escaped = []
+    pos = 0
+    while pos < len(source):
+        if source.startswith("\\N{", pos):
+            closing = source.find("}", pos + 3)
+            end = len(source) if closing < 0 else closing + 1
+            escaped.append(source[pos:end])
+        elif source[pos] == "\\":
+            escaped.append(source[pos : pos + 2])
+            end = pos + 2
+        elif source[pos] == "{" and not _COUNTED_REPEAT.match(source, pos):
+            escaped.append("\\{")
+            end = pos + 1
+        else:
+            escaped.append(source[pos])
+            end = pos + 1
+        pos = end
+    return "".join(escaped)
+
+
+def _reads_wider(source: str) -> str | None:
+    """What the engine would read into ``source`` beyond what ``re`` does, or None when nothing.
+
+    Two constructs cannot be rewritten instead: a POSIX class in a character class, and a space
+    that is not ASCII in verbose mode, which ``re`` reads as a character and the engine passes over.
+    """
+    if _VERBOSE_GROUP.search(source) and any(char.isspace() and char not in _ASCII_SPACE for char in source):
+        return "in verbose mode the engine passes over every Unicode space, and re only over the ASCII ones"
     pos = 0
     while pos < len(source):
         char = source[pos]
         if char == "\\":
             pos += 2
         elif char == "[":
-            end = pos + 1 + (source[pos + 1 : pos + 2] == "^")
-            end += source[end : end + 1] == "]"  # a leading ] is a member of the class, not its end
+            member = pos + 1 + (source[pos + 1 : pos + 2] == "^")
+            member += source[member : member + 1] == "]"  # a leading ] is a member of the class, not its end
+            end = member
             while end < len(source) and source[end] != "]":
                 end += 2 if source[end] == "\\" else 1
+            if _POSIX_CLASS.search(source, member, end + 1):
+                return (
+                    "the engine reads a POSIX class such as [[:alpha:]] in a character class, and re a set"
+                    " of those characters"
+                )
             pos = end + 1
-        elif char == "{" and not _COUNTED_REPEAT.match(source, pos):
-            return True
         else:
             pos += 1
-    return False
+    return None
 
 
 def _compile_allow_pattern(source: str) -> regex.Pattern | None:
     """``source`` compiled for the engine that bounds the match time, or None when it is ignored.
 
-    Python's ``re`` decides what is a valid pattern, so the syntax is the documented one and
-    the engine's own extensions cannot give a pattern another meaning.
+    Python's ``re`` decides what is a valid pattern and what it means, so the syntax is the
+    documented one and the engine's own extensions cannot give a pattern another meaning: a brace
+    that ``re`` reads as a literal reaches the engine escaped, and what cannot be rewritten is
+    refused.
     """
     try:
-        re.compile(source)
-        if _reads_as_fuzzy_match(source):
-            LOGGER.warning(
-                "Ignoring allow-list pattern %r: a '{' that opens no counted repeat is a fuzzy match for the regex engine, write it as '\\{'",
-                source,
-            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)  # what re suspects of a nested set is settled here
+            re.compile(source)
+        if wider := _reads_wider(source):
+            LOGGER.warning("Ignoring allow-list pattern %r: %s", source, wider)
             return None
-        compiled = regex.compile(source)
+        compiled = regex.compile(_braces_escaped(source))
         if compiled.fullmatch("") is not None:
             LOGGER.warning("Ignoring allow-list pattern %r: it can match nothing, so it would stand for any text", source)
             return None
