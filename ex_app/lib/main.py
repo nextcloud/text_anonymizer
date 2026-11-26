@@ -192,25 +192,20 @@ def _env_settings() -> Settings:
     return Settings.from_env()
 
 
-def _default_or_none(settings: Settings) -> Settings | None:
-    """None when the resolution equals the built-in defaults, so the detection pipeline runs
-    unfiltered instead of applying a no-op filter pass."""
-    return None if settings == Settings() else settings
+def _resolve_settings(records: Iterable[Any]) -> Settings:
+    """Detection settings in force: the environment values with the admin-saved appconfig ``records``
+    (what ``appconfig_ex.get_values`` returns) layered on top; the built-in defaults when nothing
+    is set, which the pipeline leaves the detections alone for."""
+    return apply_admin_config(_env_settings(), {record.key: record.value for record in records})
 
 
-def _resolve_settings(records: Iterable[Any]) -> Settings | None:
-    """Detection settings: the environment values with the admin-saved appconfig ``records``
-    (what ``appconfig_ex.get_values`` returns) layered on top."""
-    return _default_or_none(apply_admin_config(_env_settings(), {record.key: record.value for record in records}))
-
-
-def _environment_settings(error: Exception) -> Settings | None:
+def _environment_settings(error: Exception) -> Settings:
     """The environment values alone, for when the admin-saved appconfig could not be read."""
     LOGGER.warning("Admin detection settings could not be read, environment values stay in force: %s", error)
-    return _default_or_none(_env_settings())
+    return _env_settings()
 
 
-async def _resolve_task_settings(nc: AsyncNextcloudApp) -> Settings | None:
+async def _resolve_task_settings(nc: AsyncNextcloudApp) -> Settings:
     """Detection settings for one task; a failed server read keeps the environment values."""
     try:
         records = await nc.appconfig_ex.get_values(list(ADMIN_CONFIG_KEYS))
@@ -219,7 +214,7 @@ async def _resolve_task_settings(nc: AsyncNextcloudApp) -> Settings | None:
     return _resolve_settings(records)
 
 
-def _resolve_action_settings(nc: NextcloudApp) -> Settings | None:
+def _resolve_action_settings(nc: NextcloudApp) -> Settings:
     """Detection settings for a Files action, through the synchronous client; a failed server read keeps the
     environment values."""
     try:
@@ -346,11 +341,7 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
             nc.notifications.create(f"Could not redact {node.name}", "The file is not a UTF-8 encoded text file.")
             return
         copy_path = redacted_copy_path(nc, node.user_path)
-        settings = _resolve_action_settings(nc)
-        if settings is None:
-            redacted = redact_text(text)
-        else:
-            redacted = redact_text(text, settings=settings)
+        redacted = redact_text(text, settings=_resolve_action_settings(nc))
         nc.files.upload(copy_path, redacted)
         nc.notifications.create(f"Redacted copy of {node.name} saved as {posixpath.basename(copy_path)}")
     except Exception as e:

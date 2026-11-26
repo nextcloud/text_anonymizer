@@ -10,8 +10,8 @@ by field id, so the form field ids and the appconfig keys are the environment va
 names (see :data:`ADMIN_CONFIG_KEYS`).
 
 :func:`filter_results` applies a resolved :class:`Settings` to analyzer results, so the
-detection pipeline (anonymizer module), the evaluation harness (evals/) and any task wiring
-share one predicate for the three knobs.
+detection pipeline (anonymizer module) and any task wiring share one predicate for the
+three knobs.
 """
 
 from __future__ import annotations

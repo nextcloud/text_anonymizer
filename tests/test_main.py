@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import main
 import pytest
-from config import ENV_ALLOW_PATTERNS
+from config import ADMIN_CONFIG_KEYS, ENV_ALLOW_PATTERNS, Settings
 from nc_py_api import NextcloudException
 from nc_py_api.files import ActionFileInfo
 
@@ -87,7 +87,7 @@ def test_redacted_copy_path(user_path, existing, expected):
 
 
 def test_redact_file_uploads_redacted_copy(monkeypatch):
-    monkeypatch.setattr(main, "redact_text", lambda text: text.replace("John", "<PERSON>"))
+    monkeypatch.setattr(main, "redact_text", lambda text, settings: text.replace("John", "<PERSON>"))
     nc = make_nc()
     node = nc.files.by_id.return_value
     node.is_dir = False
@@ -100,6 +100,26 @@ def test_redact_file_uploads_redacted_copy(monkeypatch):
     nc.files.by_id.assert_called_once_with(42)
     nc.files.upload.assert_called_once_with("/dir/notes (redacted).txt", "Hi <PERSON>")
     nc.notifications.create.assert_called_once_with("Redacted copy of notes.txt saved as notes (redacted).txt")
+
+
+def test_redact_file_hands_the_settings_over_when_nothing_is_set(monkeypatch):
+    """With nothing set anywhere the action makes the same call as with settings: what the built-in defaults
+    mean is decided in the pipeline, not once more in the action."""
+    for key in ADMIN_CONFIG_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    main._env_settings.cache_clear()
+    redact_text = MagicMock(return_value="Hi")
+    monkeypatch.setattr(main, "redact_text", redact_text)
+    nc = make_nc()
+    node = nc.files.by_id.return_value
+    node.is_dir = False
+    node.name = "notes.txt"
+    node.user_path = "/notes.txt"
+    nc.files.download.return_value = b"Hi"
+
+    main.redact_file(nc, make_file_info())
+
+    redact_text.assert_called_once_with("Hi", settings=Settings())
 
 
 @pytest.mark.parametrize("is_dir", [None, True])

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from presidio_analyzer import RecognizerResult
 
+import anonymizer
 import main
 from config import (
     ADMIN_CONFIG_KEYS,
@@ -120,8 +121,13 @@ def test_a_failed_read_keeps_the_environment_values_with_a_warning(resolve, monk
 
 
 @pytest.mark.parametrize("resolve", [resolve_task, resolve_action], ids=["task", "action"])
-def test_nothing_set_anywhere_resolves_to_none_so_the_pipeline_runs_unfiltered(resolve):
-    assert resolve(make_nc()) is None
+def test_nothing_set_anywhere_resolves_to_the_built_in_defaults_which_filter_nothing(resolve):
+    """The resolvers say what is in force and nothing more: the built-in defaults are what nothing set comes to,
+    and the pipeline alone decides that they leave the detections untouched."""
+    assert resolve(make_nc()) == Settings()
+    text = "Anna Meyer works in Berlin."
+    results = [RecognizerResult("PERSON", 0, 10, 0.85), RecognizerResult("LOCATION", 20, 26, 0.85)]
+    assert anonymizer._apply_settings(results, text, resolve(make_nc())) == results
 
 
 @pytest.mark.parametrize("resolve", [resolve_task, resolve_action], ids=["task", "action"])
