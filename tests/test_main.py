@@ -85,7 +85,13 @@ def test_redacted_copy_path(user_path, existing, expected):
 
 
 def test_redact_file_uploads_redacted_copy(monkeypatch):
-    monkeypatch.setattr(main, "redact_text", lambda text: text.replace("John", "<PERSON>"))
+    redactions = []
+
+    def redact_text(text, language, foreign_identifiers):
+        redactions.append((language, foreign_identifiers))
+        return text.replace("John", "<PERSON>")
+
+    monkeypatch.setattr(main, "redact_text", redact_text)
     nc = make_nc()
     node = nc.files.by_id.return_value
     node.is_dir = False
@@ -98,6 +104,9 @@ def test_redact_file_uploads_redacted_copy(monkeypatch):
     nc.files.by_id.assert_called_once_with(42)
     nc.files.upload.assert_called_once_with("/dir/notes (redacted).txt", "Hi <PERSON>")
     nc.notifications.create.assert_called_once_with("Redacted copy of notes.txt saved as notes (redacted).txt")
+    # The Files action has no language input: the text decides its language, and the identifiers of every
+    # supported language are redacted.
+    assert redactions == [(None, True)]
 
 
 @pytest.mark.parametrize("is_dir", [None, True])
@@ -190,10 +199,10 @@ def make_async_nc():
 
 
 def test_process_task_reports_output_and_progress(monkeypatch):
-    def handler(text, on_progress):
+    def handler(task_input, on_progress):
         on_progress(50.0)
         on_progress(100.0)
-        return text.upper()
+        return {"output": task_input["input"].upper()}
 
     monkeypatch.setitem(main.TASK_HANDLERS, "text_anonymizer:redact_pii", handler)
     nc = make_async_nc()

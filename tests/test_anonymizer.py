@@ -14,6 +14,8 @@ from presidio_anonymizer import AnonymizerEngine
 class FakeAnalyzer:
     """Reports every match of the given ``(entity_type, pattern, score)`` rules, recording each analyzed text."""
 
+    supported_languages = ["en"]
+
     def __init__(self, *rules: tuple[str, str, float]):
         self.rules = rules
         self.calls: list[str] = []
@@ -118,6 +120,12 @@ def test_redact_text_across_chunks(analyzer, monkeypatch):
 @pytest.mark.skipif(importlib.util.find_spec("en_core_web_lg") is None, reason="en_core_web_lg is not installed")
 class TestWithSpacyModel:
     TEXT = "My name is John Smith and my email address is john.smith@example.com."
+
+    @pytest.fixture(autouse=True)
+    def spacy_engine(self, monkeypatch):
+        """GLiNER is the default engine here: the spaCy model is asked for explicitly and built anew."""
+        monkeypatch.setenv(anonymizer.ENGINE_ENV_VAR, anonymizer.ENGINE_SPACY)
+        monkeypatch.setattr(anonymizer, "_ENGINES", None)
 
     def test_detect_pii(self):
         lines = anonymizer.detect_pii(self.TEXT).splitlines()
