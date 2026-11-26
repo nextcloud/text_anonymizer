@@ -10,10 +10,14 @@ installed, e.g. in lint-only environments; the metric and dataset tests always r
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
+import anonymizer
 import pytest
+from presidio_analyzer import RecognizerResult
+from presidio_anonymizer import AnonymizerEngine
 
 EVALS_DIR = Path(__file__).resolve().parents[1] / "evals"
 if str(EVALS_DIR) not in sys.path:
@@ -140,6 +144,93 @@ def test_build_settings_rejects_out_of_range_threshold() -> None:
         eval_run.build_settings(args)
 
 
+class FakeAnalyzer:
+    """Reports every match of the given ``(entity_type, pattern, score)`` rules."""
+
+    def __init__(self, *rules: tuple[str, str, float]) -> None:
+        self.rules = rules
+
+    def analyze(self, text: str, language: str) -> list[RecognizerResult]:
+        assert language == "en"
+        return [
+            RecognizerResult(entity_type, match.start(), match.end(), score)
+            for entity_type, pattern, score in self.rules
+            for match in re.finditer(pattern, text)
+        ]
+
+
+def _use_fake_analyzer(monkeypatch, *rules: tuple[str, str, float]) -> None:
+    """Give the benchmark and the app the same fake analyzer, with a real anonymizer."""
+    engines = (FakeAnalyzer(*rules), AnonymizerEngine())
+    monkeypatch.setattr(eval_run, "_get_engines", lambda: engines)
+    monkeypatch.setattr(anonymizer, "_get_engines", lambda: engines)
+
+
+MAIL_RULES = (
+    ("EMAIL_ADDRESS", r"[\w.]+@example\.com", 1.0),
+    ("URL", r"example\.com", 0.5),
+    ("PERSON", r"Jane", 0.85),
+)
+MAIL_TEXT = "Mail Jane.Doe@example.com from Jane."
+
+
+def test_detect_scores_the_entities_the_app_reports(monkeypatch) -> None:
+    """A detection the app's overlap resolution drops, such as a URL inside an e-mail address, is not scored."""
+    _use_fake_analyzer(monkeypatch, *MAIL_RULES)
+
+    detected = eval_run.detect(MAIL_TEXT, Settings())
+
+    assert [(e.type, MAIL_TEXT[e.start : e.end], e.score) for e in detected] == [
+        ("EMAIL_ADDRESS", "Jane.Doe@example.com", 1.0),
+        ("PERSON", "Jane", 0.85),
+    ]
+    assert anonymizer.detect_pii(MAIL_TEXT) == "EMAIL_ADDRESS: Jane.Doe@example.com\nPERSON: Jane"
+
+
+def test_detect_applies_the_settings_before_the_overlap_resolution(monkeypatch) -> None:
+    """As in the app: an ignored e-mail address leaves visible the entities that were hidden inside it."""
+    _use_fake_analyzer(monkeypatch, *MAIL_RULES)
+    settings = Settings(ignored_entity_types=frozenset({"EMAIL_ADDRESS"}))
+
+    detected = eval_run.detect(MAIL_TEXT, settings)
+
+    assert [(e.type, MAIL_TEXT[e.start : e.end]) for e in detected] == [
+        ("PERSON", "Jane"),
+        ("URL", "example.com"),
+        ("PERSON", "Jane"),
+    ]
+    assert anonymizer.detect_pii(MAIL_TEXT, settings=settings) == "PERSON: Jane\nURL: example.com"
+
+
+def test_detect_merges_entities_of_one_type_as_the_app_does(monkeypatch) -> None:
+    """Intersecting entities of one type and neighbours of one type separated by spaces become one span."""
+    _use_fake_analyzer(
+        monkeypatch,
+        ("PERSON", r"John Sm", 0.85),
+        ("PERSON", r"Smith", 0.4),
+        ("LOCATION", r"New", 0.6),
+        ("LOCATION", r"York", 0.9),
+    )
+    text = "John Smith lives in New York."
+
+    detected = eval_run.detect(text, Settings())
+
+    assert [(e.type, text[e.start : e.end]) for e in detected] == [("PERSON", "John Smith"), ("LOCATION", "New York")]
+
+
+def test_detect_refuses_a_text_where_two_entity_types_overlap_partly(monkeypatch) -> None:
+    """After a partial overlap of two types, the offsets Presidio reports do not address the text."""
+    _use_fake_analyzer(
+        monkeypatch,
+        ("PERSON", r"Anna Berlin", 0.85),
+        ("LOCATION", r"Berlin Street", 0.6),
+        ("EMAIL_ADDRESS", r"a@b\.com", 1.0),
+    )
+
+    with pytest.raises(ValueError, match="overlap partly"):
+        eval_run.detect("Anna Berlin Street, mail a@b.com", Settings())
+
+
 def _require_spacy_model() -> None:
     try:
         import en_core_web_lg  # noqa: F401
@@ -174,3 +265,13 @@ def test_live_detection_applies_the_admin_filter_path() -> None:
     ignored = eval_run.detect(sensitive.text, Settings(ignored_entity_types=frozenset({"CREDIT_CARD"})))
     assert not any(e.type == "CREDIT_CARD" for e in ignored)
     assert len(ignored) < len(baseline)
+
+
+@pytest.mark.spacy
+def test_live_detect_scores_what_the_detect_task_lists() -> None:
+    """On every sample of the dataset, the benchmark scores the entities the detect task lists."""
+    _require_spacy_model()
+    for sample in eval_run.load_dataset(eval_run.DEFAULT_DATASET):
+        detected = eval_run.detect(sample.text, Settings())
+        scored = {f"{entity.type}: {sample.text[entity.start : entity.end]}" for entity in detected}
+        assert scored == set(anonymizer.detect_pii(sample.text).splitlines())

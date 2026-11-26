@@ -9,7 +9,7 @@ from collections.abc import Callable
 from config import Settings, filter_results
 from presidio_analyzer import AnalyzerEngine, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
+from presidio_anonymizer.entities import OperatorConfig, OperatorResult
 
 ProgressCallback = Callable[[float], None]
 
@@ -73,6 +73,13 @@ def _apply_settings(
     return filter_results(results, text, settings)
 
 
+def _resolve_overlaps(
+    anonymizer: AnonymizerEngine, text: str, results: list[RecognizerResult]
+) -> list[OperatorResult]:
+    """Return the entities left after resolving the overlaps in ``results`` as :func:`redact_text` does."""
+    return anonymizer.anonymize(text=text, analyzer_results=results, operators=_KEEP_OPERATORS).items
+
+
 def detect_pii(
     text: str, language: str = "en", on_progress: ProgressCallback | None = None, settings: Settings | None = None
 ) -> str:
@@ -83,7 +90,7 @@ def detect_pii(
     """
     analyzer, anonymizer = _get_engines()
     results = _apply_settings(_analyze(analyzer, text, language, on_progress), text, settings)
-    items = anonymizer.anonymize(text=text, analyzer_results=results, operators=_KEEP_OPERATORS).items
+    items = _resolve_overlaps(anonymizer, text, results)
     entities = dict.fromkeys((item.entity_type, item.text) for item in sorted(items, key=lambda item: item.start))
     return "\n".join(f"{entity_type}: {value}" for entity_type, value in entities)
 

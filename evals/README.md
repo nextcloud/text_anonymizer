@@ -22,6 +22,26 @@ deployed:
 python evals/run.py --threshold 0.4 --ignore URL,DATE_TIME --allow 'Nextcloud GmbH|Apple Inc\.'
 ```
 
+## What is scored
+
+The numbers describe what the app reports. Each text goes through the pipeline of the
+task types: the analyzer, the settings given by the flags, then the overlap resolution
+the redaction applies (Presidio's anonymizer with the keep operators, as `detect_pii`
+calls it). The entities left are compared with the annotations:
+
+- An entity contained in a longer one of another type is dropped, for example a URL
+  recognized inside an e-mail address. It is still redacted, as part of the longer
+  entity, but an annotation of it counts as a miss of its type.
+- Entities of one type that intersect, or that only a space separates, become one span.
+- The settings apply before the resolution: ignoring a type or raising the threshold
+  brings back the entities that a dropped one contained.
+
+Every occurrence counts, while the detect task lists a value that occurs twice once.
+The score shown with a false positive is the confidence Presidio gives the entity after
+the resolution; a threshold applies to the analyzer's results before it. The texts are
+analyzed as English, as the tasks do. A text where two entities of different types
+overlap partly is refused: Presidio then reports offsets that do not address the text.
+
 ## Dataset format
 
 `dataset.jsonl` holds one JSON object per line:

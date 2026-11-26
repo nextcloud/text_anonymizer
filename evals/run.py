@@ -5,9 +5,9 @@
 r"""Benchmark runner: precision, recall and F-scores of the PII detector against a labeled dataset.
 
 The dataset is JSONL, one ``{"text": ..., "entities": [{"type", "start", "end", "text"}, ...]}``
-object per line. Each text is run through the app's own analysis pipeline (the same Presidio
-engine and chunking the task types use) and the detected spans are compared with the
-annotated ground truth:
+object per line. Each text is run through the app's own detection pipeline (the same Presidio
+engine, settings filtering, chunking and overlap resolution the task types use) and the entities
+left are compared with the annotated ground truth:
 
 * exact match: same entity type and identical offsets
 * partial match: same entity type and overlapping spans (preserves credit when the detector
@@ -33,12 +33,16 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from presidio_analyzer import RecognizerResult
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorResult
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "ex_app" / "lib"))
 
-# The public detect/redact API returns formatted text without offsets, but a span-based
-# benchmark needs the raw results of the app's real chunked analysis pipeline.
-from anonymizer import _analyze, _get_engines  # noqa: E402
+# The public detect/redact API returns text without offsets, but a span-based benchmark needs the
+# entities of the app's own pipeline, analysis and overlap resolution included, as spans.
+from anonymizer import _analyze, _get_engines, _resolve_overlaps  # noqa: E402
 from config import Settings, filter_results, parse_allow_patterns, parse_ignored_entity_types  # noqa: E402
 
 DEFAULT_DATASET = Path(__file__).resolve().parent / "dataset.jsonl"
@@ -47,7 +51,8 @@ OVERALL = "OVERALL"
 
 @dataclass(frozen=True)
 class Entity:
-    """One annotated or detected entity span; ``score`` is the Presidio confidence if known."""
+    """One annotated or detected entity span; ``score`` is the confidence Presidio gives a detected
+    entity after the overlap resolution, ``None`` on an annotation."""
 
     type: str
     start: int
@@ -104,17 +109,35 @@ def load_dataset(path: Path) -> list[Sample]:
     return samples
 
 
-def detect(text: str, settings: Settings) -> list[Entity]:
-    """Run the app's analyzer pipeline on ``text`` and apply the configured filters.
+def _located_items(anonymizer: AnonymizerEngine, text: str, results: list[RecognizerResult]) -> list[OperatorResult]:
+    """The entities the app keeps for ``text``, in the order of the text, each checked against its place.
 
-    The unfiltered baseline is what the task types produce; a non-default settings
-    object goes through the production predicate (config.filter_results).
+    Raises ``ValueError`` when an entity's offsets do not address ``text``: with the keep operators, Presidio
+    counts the offsets of every entity after two entities of different types that overlap partly from the text
+    it builds, which repeats the overlapping part, so such a text cannot be scored by offsets.
     """
-    analyzer, _ = _get_engines()
+    items = sorted(_resolve_overlaps(anonymizer, text, results), key=lambda item: item.start)
+    shifted = next((item for item in items if text[item.start : item.end] != item.text), None)
+    if shifted is not None:
+        raise ValueError(
+            f"cannot score a text where entities of different types overlap partly: "
+            f"the offsets of {shifted.entity_type} {shifted.text!r} do not address the text {text!r}"
+        )
+    return items
+
+
+def detect(text: str, settings: Settings) -> list[Entity]:
+    """Run the app's detection pipeline on ``text`` and return the entities it leaves, as spans.
+
+    The analyzer, the configured filters and the overlap resolution of :func:`anonymizer.detect_pii` run in
+    that order, so the entities returned are the ones the app reports and redacts.
+    """
+    analyzer, anonymizer = _get_engines()
     results = _analyze(analyzer, text, "en", None)
     if settings != Settings():
         results = filter_results(results, text, settings)
-    return [Entity(type=r.entity_type, start=r.start, end=r.end, score=r.score) for r in results]
+    items = _located_items(anonymizer, text, results)
+    return [Entity(type=item.entity_type, start=item.start, end=item.end, score=item.score) for item in items]
 
 
 def match_exact(detected: list[Entity], truth: list[Entity]) -> tuple[list[Entity], list[Entity]]:
@@ -317,14 +340,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = build_settings(args)
         samples = load_dataset(args.dataset)
+        print("Loading the analyzer (the spaCy model load takes a few seconds)...")
+        engine_started = time.perf_counter()
+        _get_engines()
+        engine_seconds = time.perf_counter() - engine_started
+        result = run(samples, settings, max(0, args.examples))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    print("Loading the analyzer (the spaCy model load takes a few seconds)...")
-    engine_started = time.perf_counter()
-    _get_engines()
-    engine_seconds = time.perf_counter() - engine_started
-    result = run(samples, settings, max(0, args.examples))
     truth_total = sum(len(sample.truth) for sample in samples)
     print()
     print(f"Dataset: {args.dataset} ({len(samples)} texts, {truth_total} annotated entities)")
