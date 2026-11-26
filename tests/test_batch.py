@@ -799,8 +799,25 @@ def run_in_threads(*targets) -> None:
     assert not failures, failures
 
 
-def test_double_dispatch_redacts_each_file_once_and_sends_one_summary(monkeypatch):
-    """A double click dispatches the same folder action twice: one run redacts, the other is dropped."""
+DROPPED_REQUEST = "This request was ignored. The result of the one started first comes as a separate notification."
+
+
+def slow_until(started: threading.Event, release: threading.Event):
+    """A redaction that blocks the first call until ``release`` is set, after ``started`` was set."""
+    calls = []
+
+    def redact(text):
+        if not calls:
+            calls.append(text)
+            started.set()
+            assert release.wait(timeout=10)
+        return fake_redact(text)
+
+    return redact
+
+
+def test_double_dispatch_redacts_each_file_once_and_tells_about_the_dropped_click(monkeypatch):
+    """A double click dispatches the same folder action twice: one run redacts, the other is dropped and said."""
     nc = FakeNc()
     docs = nc.files.add_dir("docs")
     nc.files.add_file("docs/a.txt", b"one", "text/plain")
@@ -808,13 +825,7 @@ def test_double_dispatch_redacts_each_file_once_and_sends_one_summary(monkeypatc
     monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
     started = threading.Event()
     release = threading.Event()
-
-    def slow_redact(text):
-        started.set()
-        assert release.wait(timeout=10)
-        return fake_redact(text)
-
-    monkeypatch.setattr(batch, "redact_text", slow_redact)
+    monkeypatch.setattr(batch, "redact_text", slow_until(started, release))
     first = threading.Thread(target=main.redact_files, args=("admin", [action_info(docs, "dir")]), name="first")
     first.start()
     assert started.wait(timeout=10)
@@ -824,7 +835,100 @@ def test_double_dispatch_redacts_each_file_once_and_sends_one_summary(monkeypatc
     first.join(timeout=10)
     assert not first.is_alive()
     assert sorted(nc.files.uploads) == ["docs/a (redacted).txt", "docs/b (redacted).txt"]
-    assert [subject for subject, _message in nc.notifications.created] == ["Redacted text files in docs"]
+    assert nc.notifications.created == [
+        ("docs is already being redacted", DROPPED_REQUEST),
+        ("Redacted text files in docs", "2 files processed, 2 redacted, 0 failed, 0 skipped."),
+    ]
+    assert not main._ACTIONS_RUNNING
+
+
+def test_a_repeated_request_on_a_selection_is_left_out_as_a_whole(monkeypatch):
+    """A second click on a selection of files redacts none of them a second time, and one notification says so."""
+    nc = FakeNc()
+    nodes = [nc.files.add_file(f"{name}.txt", b"one", "text/plain") for name in ("a", "b", "c")]
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    started = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(main, "redact_text", slow_until(started, release))
+    selection = [action_info(node, "file") for node in nodes]
+    first = threading.Thread(target=main.redact_files, args=("admin", selection), name="first")
+    first.start()
+    assert started.wait(timeout=10)
+    main.redact_files("admin", selection)
+    release.set()
+    first.join(timeout=10)
+    assert not first.is_alive()
+    assert sorted(nc.files.uploads) == ["a (redacted).txt", "b (redacted).txt", "c (redacted).txt"]
+    assert nc.notifications.created == [
+        ("3 of the selected files are already being redacted", DROPPED_REQUEST),
+        *[(f"Redacted copy of {name}.txt saved as {name} (redacted).txt", "") for name in ("a", "b", "c")],
+    ]
+
+
+def test_a_failed_notification_of_a_dropped_file_does_not_cost_the_other_files(monkeypatch):
+    """The notification is one request like any other; its failure must not stop the files that are to be redacted."""
+    nc = FakeNc()
+    busy = nc.files.add_file("busy.txt", b"one", "text/plain")
+    free = nc.files.add_file("free.txt", b"two", "text/plain")
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    monkeypatch.setattr(main, "redact_text", fake_redact)
+    create = nc.notifications.create
+
+    def failing_create(subject, message="", **kwargs):
+        if subject.startswith("busy.txt is already being redacted"):
+            raise NextcloudException(503, "Server error")
+        return create(subject, message, **kwargs)
+
+    nc.notifications.create = failing_create
+    with main._ACTIONS_RUNNING_GUARD:
+        main._ACTIONS_RUNNING.add(("admin", busy.info.fileid))  # an action of the same user runs on it already
+    try:
+        main.redact_files("admin", [action_info(busy, "file"), action_info(free, "file")])
+    finally:
+        with main._ACTIONS_RUNNING_GUARD:
+            main._ACTIONS_RUNNING.discard(("admin", busy.info.fileid))
+    assert list(nc.files.uploads) == ["free (redacted).txt"]
+    assert nc.notifications.created == [("Redacted copy of free.txt saved as free (redacted).txt", "")]
+
+
+def test_actions_running_are_released_when_an_action_raises(monkeypatch):
+    """An action that raises must not leave its node claimed: later actions on it would be dropped for ever."""
+    nc = FakeNc()
+    nodes = [nc.files.add_file(f"{name}.txt", b"one", "text/plain") for name in ("a", "b")]
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+
+    def failing(_nc, _file_info):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main, "redact_file", failing)
+    with pytest.raises(RuntimeError, match="boom"):
+        main.redact_files("admin", [action_info(node, "file") for node in nodes])
+    assert not main._ACTIONS_RUNNING
+
+
+def test_an_action_of_another_user_on_the_same_node_is_not_dropped(monkeypatch):
+    """The claim is per user: two users may act on one file; the lock of the file keeps their copies unique."""
+    nc = FakeNc()
+    node = nc.files.add_file("notes.txt", b"one", "text/plain")
+    monkeypatch.setattr(main, "NextcloudApp", lambda: nc)
+    started = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(main, "redact_text", slow_until(started, release))
+    first = threading.Thread(target=main.redact_files, args=("alice", [action_info(node, "file")]), name="first")
+    first.start()
+    assert started.wait(timeout=10)
+    second = threading.Thread(target=main.redact_files, args=("bob", [action_info(node, "file")]), name="second")
+    second.start()
+    time.sleep(0.3)
+    release.set()
+    for thread in (first, second):
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert nc.files.upload_log == ["notes (redacted).txt"]
+    assert [subject for subject, _message in nc.notifications.created] == [
+        "Redacted copy of notes.txt saved as notes (redacted).txt",
+        "A redacted copy of notes.txt is already up to date",
+    ]
 
 
 def test_folder_run_and_file_action_on_one_file_write_one_copy(monkeypatch):
@@ -1042,15 +1146,16 @@ def test_repeated_runs_after_an_edit_add_no_copy():
         assert [result.node.name for result in report.skipped] == ["a (redacted 2).txt", "a (redacted).txt", "a.txt"]
 
 
-def test_single_file_action_on_a_copy_is_a_no_op_whatever_its_age(monkeypatch):
+def test_single_file_action_on_a_copy_says_that_it_is_one_and_writes_nothing(monkeypatch):
+    """A redacted copy is never redacted again, whatever its age; the user is told that the file is one."""
     nc, _docs = _copies_tree()
     monkeypatch.setattr(main, "redact_text", fake_redact)
     for name in ("docs/a (redacted).txt", "docs/a (redacted 2).txt"):
         main.redact_file(nc, action_info(nc.files.nodes[name], "file"))
     assert nc.files.uploads == {}
     assert nc.notifications.created == [
-        ("A redacted copy of a (redacted).txt is already up to date", ""),
-        ("A redacted copy of a (redacted 2).txt is already up to date", ""),
+        ("a (redacted).txt is already a redacted copy", ""),
+        ("a (redacted 2).txt is already a redacted copy", ""),
     ]
 
 

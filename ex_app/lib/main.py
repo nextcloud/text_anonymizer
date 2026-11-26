@@ -4,7 +4,6 @@
 """ExApp server providing TaskProcessing tasks and a Files action for detecting and redacting PII."""
 
 import asyncio
-import functools
 import logging
 import logging.handlers
 import os
@@ -12,11 +11,12 @@ import posixpath
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any
 
+import batch
 from anonymizer import detect_pii, redact_text
 from batch import LOGGER as BATCH_LOGGER
 from batch import BatchReport, oversize_detail, redact_file_copy, redact_folder
@@ -264,6 +264,9 @@ def redact_file(nc: NextcloudApp, file_info: ActionFileInfo) -> None:
         if reason is not None:
             nc.notifications.create(f"Could not redact {node.name}", f"The file is {reason} and was skipped.")
             return
+        if batch.is_redacted_copy(node.user_path):
+            nc.notifications.create(f"{node.name} is already a redacted copy")
+            return
         # The Files action has no language input surface; English is redact_text's default.
         try:
             copy_path = redact_file_copy(nc, node, redact_text)
@@ -329,36 +332,60 @@ def notify_batch_summary(nc: NextcloudApp, report: BatchReport) -> None:
     nc.notifications.create(f"Redacted text files in {report.folder_name}", message)
 
 
-# Files actions run as background tasks, and a double click can dispatch the same action twice within about a
-# second. A second action on the same node of the same user is dropped while the first one runs: it could only
-# wait for the first one and then report its files as skipped. Copies are kept unique by the lock of each
-# original file (see ``redact_file_copy``), which also covers a folder run and a file action on one file.
+# Files actions run as background tasks, and a double click can dispatch the same request twice within about a
+# second. The nodes of a request are claimed when it starts: one on which an action of the same user runs already
+# is left out, as it could only wait for the first one and then report its files as skipped, and the user is told
+# so by a notification. Copies are kept unique by the lock of each original file (see ``redact_file_copy``), which
+# also covers a folder run and a file action on one file.
 _ACTIONS_RUNNING: set[tuple[str, int]] = set()
 _ACTIONS_RUNNING_GUARD = threading.Lock()
 
 
-def _run_once_per_node(user_id: str, file_id: int, action: Callable[[], None]) -> None:
-    """Run ``action`` unless an action on the same node of the same user runs already."""
+def _claim_nodes(user_id: str, file_ids: Iterable[int]) -> set[int]:
+    """Claim each node for an action of the user unless one runs already; return the file ids of those."""
     with _ACTIONS_RUNNING_GUARD:
-        if (user_id, file_id) in _ACTIONS_RUNNING:
-            return
-        _ACTIONS_RUNNING.add((user_id, file_id))
+        running = {file_id for file_id in file_ids if (user_id, file_id) in _ACTIONS_RUNNING}
+        _ACTIONS_RUNNING.update((user_id, file_id) for file_id in file_ids if file_id not in running)
+    return running
+
+
+def _release_nodes(user_id: str, file_ids: Iterable[int]) -> None:
+    """Give nodes back, so that a later action of the user on them runs."""
+    with _ACTIONS_RUNNING_GUARD:
+        _ACTIONS_RUNNING.difference_update((user_id, file_id) for file_id in file_ids)
+
+
+def notify_actions_running(nc: NextcloudApp, files: list[ActionFileInfo]) -> None:
+    """Tell the user that their request on ``files`` was left out because an action on them runs already."""
+    if len(files) == 1:
+        subject = f"{files[0].name} is already being redacted"
+    else:
+        subject = f"{len(files)} of the selected files are already being redacted"
     try:
-        action()
-    finally:
-        with _ACTIONS_RUNNING_GUARD:
-            _ACTIONS_RUNNING.discard((user_id, file_id))
+        nc.notifications.create(
+            subject, "This request was ignored. The result of the one started first comes as a separate notification."
+        )
+    except Exception as e:
+        LOGGER.error("Failed to tell the user that an action on %s runs already: %s", files[0].name, e)
 
 
 def redact_files(user_id: str, files: list[ActionFileInfo]) -> None:
     nc = NextcloudApp()
     nc.set_user(user_id)
     log_at_nextcloud_level(nc)  # the capabilities of the user are fetched by set_user; this costs no request
-    for file_info in files:
-        # AppAPI's Files payload reports directories as "folder" (current files plugin)
-        # or "dir" (older payloads); both dispatch to the folder action.
-        redact = redact_folder_action if file_info.fileType.lower() in ("dir", "folder") else redact_file
-        _run_once_per_node(user_id, file_info.fileId, functools.partial(redact, nc, file_info))
+    running = _claim_nodes(user_id, {file_info.fileId for file_info in files})
+    todo = [file_info for file_info in files if file_info.fileId not in running]
+    if running:
+        notify_actions_running(nc, [file_info for file_info in files if file_info.fileId in running])
+    try:
+        for file_info in todo:
+            # AppAPI's Files payload reports directories as "folder" (current files plugin)
+            # or "dir" (older payloads); both dispatch to the folder action.
+            redact = redact_folder_action if file_info.fileType.lower() in ("dir", "folder") else redact_file
+            redact(nc, file_info)
+            _release_nodes(user_id, [file_info.fileId])
+    finally:
+        _release_nodes(user_id, [file_info.fileId for file_info in todo])
 
 
 @APP.post(REDACT_FILE_ACTION_HANDLER)
